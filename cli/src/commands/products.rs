@@ -1,5 +1,6 @@
 //! Product declaration + status commands: `declare-product`,
-//! `declare-products`, and `status` (which folds in the product table).
+//! `declare-products`, their `undeclare-` counterparts, and `status` (which
+//! folds in the product table).
 
 use anyhow::{bail, Context as _, Result};
 
@@ -262,6 +263,155 @@ async fn post_declare_product(
     Ok(())
 }
 
+/// What may appear in an offer path unescaped: RFC 3986's unreserved set plus
+/// `/`. The slash is deliberate — the route is `{model_id:path}`, so a source
+/// id like `zai-org/GLM-5.2` is one model id and escaping its slash would 404.
+///
+/// Everything else is escaped because the path is interpolated into a URL:
+/// an unescaped `#` in a model id ends the path at a fragment and `?` starts
+/// a query, either of which would send the DELETE at a *different* offer than
+/// the one named on the command line.
+const OFFER_PATH: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
+
+/// The registry route for one offer, with the model id escaped as path data.
+///
+/// `provider` is a `&str` rather than a [`Provider`]: the fan-out withdraws
+/// what `/miners/me` reports, and the registry's spelling is authoritative
+/// there — a provider added after this CLI was built must still be
+/// withdrawable.
+pub(crate) fn offer_path(provider: &str, model: &str) -> String {
+    let provider = percent_encoding::utf8_percent_encode(provider, OFFER_PATH);
+    let model = percent_encoding::utf8_percent_encode(model, OFFER_PATH);
+    format!("/miners/products/{provider}/{model}")
+}
+
+/// Reject a model id whose path segments would be resolved away rather than
+/// sent, so a `.`/`..` segment cannot silently retarget the DELETE at another
+/// offer — or another endpoint. `.` stays legal *within* a segment, which is
+/// where real model ids use it (`gpt-5.5`).
+fn reject_dot_segments(model: &str) -> Result<()> {
+    if model.split('/').any(|seg| seg == "." || seg == "..") {
+        bail!("invalid model id {model:?}: `.` and `..` are not model path segments");
+    }
+    Ok(())
+}
+
+/// Issue one `DELETE /miners/products/{provider}/{model}` — shared by
+/// `undeclare-product` and the fan-out so both read the registry's statuses
+/// the same way. A 404 means the registry has no offer row for the pair —
+/// the common typo case — and must not read as "the endpoint is missing".
+async fn delete_offer(client: &mut RegistryClient, provider: &str, model: &str) -> Result<()> {
+    reject_dot_segments(model)?;
+    let path = offer_path(provider, model);
+    let resp = client
+        .delete(&path)
+        .await
+        .with_context(|| format!("DELETE {path}"))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "no offer for {provider}/{model} — nothing to withdraw; \
+             `gmcli status` lists what you have declared"
+        );
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(status_error("undeclare-product", status, &body));
+    }
+    Ok(())
+}
+
+/// `gmcli undeclare-product` — withdraw one offer.
+///
+/// The registry keeps the row for audit (`is_offered` goes false, reason
+/// `withdrawn_by_miner`), so withdrawal is fully reversible: re-running
+/// `declare-product` re-offers the pair.
+pub(crate) async fn cmd_undeclare_product(
+    client: &mut RegistryClient,
+    provider: &Provider,
+    model: &str,
+) -> Result<()> {
+    delete_offer(client, provider.as_str(), model).await?;
+    println!("{provider}/{model} withdrawn — buyers are no longer routed to it.");
+    println!("Changed your mind? `gmcli declare-product` re-offers it.");
+    Ok(())
+}
+
+/// The offers a fan-out withdrawal should touch: still standing
+/// (`is_offered`), optionally one provider's slice.
+///
+/// An offer already withdrawn keeps its registry row with `is_offered:
+/// false`, so re-deleting it would spend a round-trip to change nothing —
+/// and its 404-adjacent failure would pollute the summary.
+pub(crate) fn withdrawable_offers<'a>(
+    offers: &'a [ProductOfferStatus],
+    provider_filter: Option<&Provider>,
+) -> Vec<&'a ProductOfferStatus> {
+    offers
+        .iter()
+        .filter(|o| o.is_offered)
+        .filter(|o| provider_filter.is_none_or(|target| o.provider == target.as_str()))
+        .collect()
+}
+
+/// `gmcli undeclare-products` — withdraw every standing offer, or one
+/// provider's slice.
+///
+/// Targets come from the miner's own `GET /miners/me` rather than the public
+/// catalog: the catalog omits sourcing routes, and only `/miners/me` knows
+/// which offers are still standing. Mirrors `cmd_declare_products`: each
+/// result is printed individually, per-offer failures do not abort the loop,
+/// and a partial failure returns an aggregated error so the CLI exits
+/// non-zero.
+pub(crate) async fn cmd_undeclare_products(
+    client: &mut RegistryClient,
+    provider_filter: Option<&Provider>,
+) -> Result<()> {
+    let miner: MinerStatus = get_me_json(client, gm_miner_cli::client::ME_PATH).await?;
+    let targets = withdrawable_offers(&miner.products, provider_filter);
+
+    if targets.is_empty() {
+        let scope =
+            provider_filter.map_or_else(|| "any provider".to_owned(), |p| format!("provider {p}"));
+        bail!("no standing offers from {scope} to withdraw — `gmcli status` shows what you offer");
+    }
+
+    println!("Withdrawing {} offer(s)...", targets.len());
+
+    let mut ok_count = 0_usize;
+    let mut err_count = 0_usize;
+    for offer in &targets {
+        // The provider goes back to the registry exactly as it came from
+        // `/miners/me`. Round-tripping it through the `Provider` enum would
+        // make `--all` skip any offer whose provider postdates this CLI
+        // build — silently leaving it standing after a sweep that said it
+        // withdrew everything.
+        match delete_offer(client, &offer.provider, &offer.model).await {
+            Ok(()) => {
+                println!("  {}/{}: withdrawn", offer.provider, offer.model);
+                ok_count += 1;
+            }
+            Err(err) => {
+                println!("  {}/{}: ERROR {err}", offer.provider, offer.model);
+                err_count += 1;
+            }
+        }
+    }
+
+    println!("\nSummary: {ok_count} ok, {err_count} failed.");
+    if err_count > 0 {
+        bail!("{err_count} of {} withdrawals failed", targets.len());
+    }
+    println!("Re-offer any time: `gmcli declare-product` / `gmcli declare-products`.");
+    Ok(())
+}
+
 /// Pull the catalog from the public `GET /products` endpoint.
 async fn fetch_catalog(client: &mut RegistryClient) -> Result<ProductCatalogResponse> {
     let resp = client.get("/products").await.context("GET /products")?;
@@ -488,6 +638,20 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "sources": sources,
                 "generated_at": "2026-07-27T10:00:00Z",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_me(server: &MockServer, products: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/miners/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hotkey": "5Grw...",
+                "status": "active",
+                "last_attestation_at": null,
+                "image_compose_hash": null,
+                "products": products,
             })))
             .mount(server)
             .await;
@@ -788,5 +952,304 @@ mod tests {
         let rendered = ineligible_detail_lines(&products).join("\n");
         assert!(rendered.contains("reason : not yet checked"));
         assert!(!rendered.contains("fix    :"));
+    }
+
+    // ── undeclare ────────────────────────────────────────────────────────
+
+    /// Every path a DELETE was issued against, in order.
+    async fn deleted_paths(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter(|r| r.method.as_str() == "DELETE")
+            .map(|r| r.url.path().to_owned())
+            .collect()
+    }
+
+    async fn mount_withdraw(server: &MockServer, at: &str, status: u16) {
+        Mock::given(method("DELETE"))
+            .and(path(at.to_owned()))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn a_slashed_source_model_keeps_its_slashes_in_the_path() {
+        // `zai-org/GLM-5.2` is one model id, and the registry route is
+        // `{model_id:path}` — collapsing or escaping the slash would 404.
+        assert_eq!(
+            offer_path(Provider::DeepInfra.as_str(), "zai-org/GLM-5.2"),
+            "/miners/products/deepinfra/zai-org/GLM-5.2"
+        );
+    }
+
+    #[test]
+    fn a_reserved_character_cannot_truncate_the_path() {
+        // Unescaped, the `#` would end the URL's path and the DELETE would
+        // land on `openai/gpt-5` — withdrawing an offer nobody named.
+        assert_eq!(
+            offer_path("openai", "gpt-5#5"),
+            "/miners/products/openai/gpt-5%235"
+        );
+        assert_eq!(
+            offer_path("openai", "gpt-5?x=1"),
+            "/miners/products/openai/gpt-5%3Fx%3D1"
+        );
+    }
+
+    #[test]
+    fn a_normal_model_id_is_still_written_plainly() {
+        // Escaping must not reach the characters real model ids are made of,
+        // or every path in an error message becomes unreadable.
+        assert_eq!(
+            offer_path("anthropic", "claude-sonnet-4-6"),
+            "/miners/products/anthropic/claude-sonnet-4-6"
+        );
+        assert_eq!(
+            offer_path("openai", "gpt-5.5"),
+            "/miners/products/openai/gpt-5.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dot_segment_model_id_is_refused_before_the_wire() {
+        // `..` would be resolved away by URL normalisation, aiming the DELETE
+        // at a path the operator never typed.
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::OpenAI, "../../admin/products")
+            .await
+            .expect_err("a dot segment is not a model id");
+
+        assert!(
+            err.to_string().contains("not model path segments"),
+            "got: {err}"
+        );
+        assert!(deleted_paths(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undeclaring_withdraws_exactly_that_offer() {
+        let server = MockServer::start().await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_product(&mut client, &Provider::Anthropic, "claude-sonnet-4-6")
+            .await
+            .expect("a declared offer withdraws");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/anthropic/claude-sonnet-4-6"]
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclaring_a_source_route_hits_the_slashed_path() {
+        let server = MockServer::start().await;
+        mount_withdraw(&server, "/miners/products/deepinfra/zai-org/GLM-5.2", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_product(&mut client, &Provider::DeepInfra, "zai-org/GLM-5.2")
+            .await
+            .expect("a sourcing route withdraws");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/deepinfra/zai-org/GLM-5.2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn undeclaring_what_was_never_declared_says_so() {
+        // The registry 404s an offer it has no row for. That is the common
+        // typo case, and it must not read as "the endpoint is missing".
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/miners/products/anthropic/claude-sonnet-4-6"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"detail": "offer not found"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::Anthropic, "claude-sonnet-4-6")
+            .await
+            .expect_err("a missing offer is an error, not a silent success");
+
+        assert!(
+            err.to_string()
+                .contains("no offer for anthropic/claude-sonnet-4-6"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("gmcli status"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_registry_failure_surfaces_its_detail() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/miners/products/openai/gpt-5.6"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"detail": "database is down"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_product(&mut client, &Provider::OpenAI, "gpt-5.6")
+            .await
+            .expect_err("a 500 is not a withdrawal");
+
+        assert!(err.to_string().contains("database is down"), "got: {err}");
+        assert!(
+            !err.to_string().contains("no offer for"),
+            "only a 404 means the offer is absent; got: {err}"
+        );
+    }
+
+    fn offer_row(provider: &str, model: &str, is_offered: bool) -> serde_json::Value {
+        serde_json::json!({
+            "provider": provider, "model": model,
+            "is_offered": is_offered, "is_eligible": is_offered, "discount_bp": 500,
+        })
+    }
+
+    #[test]
+    fn the_fan_out_targets_only_offers_still_standing() {
+        // An offer already withdrawn keeps its row with `is_offered: false`.
+        // Re-deleting it would spend a round-trip to change nothing.
+        let all = offers(serde_json::json!([
+            offer_row("anthropic", "claude-sonnet-4-6", true),
+            offer_row("anthropic", "claude-opus-4-6", false),
+        ]));
+
+        let targets = withdrawable_offers(&all, None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn the_fan_out_honours_the_provider_filter() {
+        let all = offers(serde_json::json!([
+            offer_row("anthropic", "claude-sonnet-4-6", true),
+            offer_row("openai", "gpt-5.6", true),
+        ]));
+
+        let targets = withdrawable_offers(&all, Some(&Provider::OpenAI));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn the_fan_out_withdraws_one_provider_and_leaves_the_rest() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([
+                offer_row("anthropic", "claude-sonnet-4-6", true),
+                offer_row("anthropic", "claude-haiku-4-6", true),
+                offer_row("openai", "gpt-5.6", true),
+            ]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 204).await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-haiku-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect("withdrawing one provider's offers succeeds");
+
+        let mut paths = deleted_paths(&server).await;
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "/miners/products/anthropic/claude-haiku-4-6",
+                "/miners/products/anthropic/claude-sonnet-4-6",
+            ],
+            "the openai offer must survive a provider-scoped withdrawal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_withdraws_providers_this_build_has_never_heard_of() {
+        // The registry can gain a provider between CLI releases, and a miner
+        // can hold an offer on it. `--all` that quietly skipped such a row
+        // would report a clean sweep while leaving the offer serving.
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([offer_row("brandnew", "wonder-model-1", true)]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/brandnew/wonder-model-1", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_undeclare_products(&mut client, None)
+            .await
+            .expect("an unknown provider is the registry's business, not the CLI's");
+
+        assert_eq!(
+            deleted_paths(&server).await,
+            vec!["/miners/products/brandnew/wonder-model-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fan_out_with_nothing_to_withdraw_stops_before_any_delete() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([offer_row("openai", "gpt-5.6", true)]),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect_err("an empty target set is a failed command, not a silent no-op");
+
+        assert!(err.to_string().contains("anthropic"), "got: {err}");
+        assert!(deleted_paths(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_failed_withdrawal_does_not_abandon_the_others() {
+        let server = MockServer::start().await;
+        mount_me(
+            &server,
+            serde_json::json!([
+                offer_row("anthropic", "claude-sonnet-4-6", true),
+                offer_row("anthropic", "claude-haiku-4-6", true),
+            ]),
+        )
+        .await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-sonnet-4-6", 500).await;
+        mount_withdraw(&server, "/miners/products/anthropic/claude-haiku-4-6", 204).await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        let err = cmd_undeclare_products(&mut client, Some(&Provider::Anthropic))
+            .await
+            .expect_err("a partial failure must exit non-zero");
+
+        assert!(err.to_string().contains("1 of 2"), "got: {err}");
+        assert_eq!(
+            deleted_paths(&server).await.len(),
+            2,
+            "the second withdrawal must still be attempted"
+        );
     }
 }
