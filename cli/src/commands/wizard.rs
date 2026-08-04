@@ -21,10 +21,25 @@ use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::products::{cmd_declare_products, DeclareOutcome};
 
-/// Whether the wizard should keep going (`Continue`) or stop here (`Stop`).
+/// What a wizard step actually left behind.
 ///
-/// A step returns `Stop` only when the miner answered `n` to its prompt; a
-/// `skip` answer and a successful run both `Continue`.
+/// The distinction that matters is `Done` vs `Outstanding`: a step can be
+/// skipped, declined, or short of the input it needs, and in every one of
+/// those cases onboarding is not finished. Collapsing them into "carry on"
+/// is what let `cmd_init` print its success banner after a step that did
+/// nothing — so the outcome carries the command that would finish the step,
+/// and [`closing_lines`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepOutcome {
+    /// Ran to completion, or was already satisfied before the wizard started.
+    Done,
+    /// Did not happen. Carries the command that finishes it later.
+    Outstanding(String),
+    /// The miner answered `n`: stop the wizard here.
+    Stop,
+}
+
+/// Whether the wizard should keep going (`Continue`) or stop here (`Stop`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardFlow {
     Continue,
@@ -32,20 +47,73 @@ enum WizardFlow {
 }
 
 /// Drive a wizard step from a `[Y/n/skip]` prompt: on `Run` evaluate `$body`
-/// (which may `.await`) and continue; on `Skip` continue; on `Stop` stop the
-/// wizard. Collapses the identical three-arm match every step would otherwise
-/// repeat. `$body` is `Result<_>` — the `?` propagates a step failure.
+/// (which may `.await`); on `Skip` record the command as outstanding; on
+/// `Stop` stop the wizard. Collapses the identical three-arm match every step
+/// would otherwise repeat. `$body` is `Result<_>` — the `?` propagates a step
+/// failure.
 macro_rules! run_wizard_step {
-    ($title:expr, $command:expr, $assume_yes:expr, $body:expr) => {
-        match ask_step($title, $command, $assume_yes)? {
+    ($title:expr, $command:expr, $assume_yes:expr, $body:expr) => {{
+        let command = $command;
+        match ask_step($title, command, $assume_yes)? {
             StepChoice::Run => {
                 $body?;
-                Ok(WizardFlow::Continue)
+                Ok(StepOutcome::Done)
             }
-            StepChoice::Skip => Ok(WizardFlow::Continue),
-            StepChoice::Stop => Ok(WizardFlow::Stop),
+            StepChoice::Skip => Ok(StepOutcome::Outstanding(command.to_string())),
+            StepChoice::Stop => Ok(StepOutcome::Stop),
         }
-    };
+    }};
+}
+
+/// Fold one step's outcome into the run's outstanding list, and say whether
+/// the wizard should carry on.
+fn record(outcome: StepOutcome, outstanding: &mut Vec<String>) -> WizardFlow {
+    match outcome {
+        StepOutcome::Done => WizardFlow::Continue,
+        StepOutcome::Outstanding(command) => {
+            outstanding.push(command);
+            WizardFlow::Continue
+        }
+        StepOutcome::Stop => WizardFlow::Stop,
+    }
+}
+
+/// The wizard's closing summary.
+///
+/// "All set" is claimed only when every step actually ran. A banner that
+/// contradicts what just happened survived three fixes on this branch aimed at
+/// the *message*, so the decision now depends on what the steps returned, and
+/// lives in a pure function that can be asserted on without the wizard's IO.
+///
+/// `stopped` means the miner answered `n` partway: the steps after that point
+/// were never attempted, so the list is partial and the copy must not imply
+/// otherwise.
+fn closing_lines(outstanding: &[String], stopped: bool) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    if stopped {
+        lines.push("Stopped — the remaining steps were not attempted.".to_owned());
+        if !outstanding.is_empty() {
+            lines.push("Outstanding from the steps you did reach:".to_owned());
+            lines.extend(outstanding.iter().map(|command| format!("  $ {command}")));
+        }
+        lines.push("Re-run `gmcli init` to pick up where you left off.".to_owned());
+        return lines;
+    }
+    if outstanding.is_empty() {
+        lines.push("All set. Check your miner anytime:".to_owned());
+        lines.push("  $ gmcli status     # registration + product table".to_owned());
+        lines.push("  $ gmcli earnings   # on-chain emission".to_owned());
+        return lines;
+    }
+    lines.push(format!(
+        "Not finished — {} step(s) still to do:",
+        outstanding.len()
+    ));
+    lines.extend(outstanding.iter().map(|command| format!("  $ {command}")));
+    lines.push(String::new());
+    lines.push("Run those when you are ready, or `gmcli init` again to be walked".to_owned());
+    lines.push("through them. `gmcli status` shows what the registry has now.".to_owned());
+    lines
 }
 
 /// Whether the active network has a usable (non-expired) login token. A valid
@@ -105,32 +173,56 @@ pub(crate) async fn cmd_init(
         println!("Each step shows its command and asks before running. Press Enter to run, `n` to stop, `skip` to skip.");
     }
 
-    // Provider keys precede deploy: `cmd_deploy` refuses to start without at
-    // least one key (it bakes them into the CVM env), so the wizard must
-    // collect them first or the deploy step would fail before doing anything.
-    if wizard_register_hotkey(&cfg, assume_yes)? == WizardFlow::Stop {
-        return Ok(());
+    let (outstanding, stopped) = run_steps(explicit_network, api_url, cfg, assume_yes).await?;
+    for line in closing_lines(&outstanding, stopped) {
+        println!("{line}");
     }
-    if wizard_login(explicit_network, api_url.clone(), assume_yes).await? == WizardFlow::Stop {
-        return Ok(());
+    Ok(())
+}
+
+/// Run the five steps in dependency order, collecting the commands that would
+/// finish whatever did not happen.
+///
+/// Returns that list plus whether the miner stopped partway. Config is
+/// reloaded between steps because each underlying command persists to disk.
+///
+/// Provider keys precede deploy: `cmd_deploy` refuses to start without at
+/// least one key (it bakes them into the CVM env), so the wizard must collect
+/// them first or the deploy step would fail before doing anything.
+async fn run_steps(
+    explicit_network: Option<Network>,
+    api_url: Option<String>,
+    cfg: Config,
+    assume_yes: bool,
+) -> Result<(Vec<String>, bool)> {
+    let mut outstanding = Vec::new();
+
+    if record(wizard_register_hotkey(&cfg, assume_yes)?, &mut outstanding) == WizardFlow::Stop {
+        return Ok((outstanding, true));
     }
-    let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_provider_keys(explicit_network, &cfg, assume_yes)? == WizardFlow::Stop {
-        return Ok(());
-    }
-    let cfg = load_config(explicit_network, api_url.clone())?;
-    if wizard_deploy(cfg, assume_yes).await? == WizardFlow::Stop {
-        return Ok(());
-    }
-    let cfg = load_config(explicit_network, api_url)?;
-    if wizard_declare_products(cfg, assume_yes).await? == WizardFlow::Stop {
-        return Ok(());
+    let login = wizard_login(explicit_network, api_url.clone(), assume_yes).await?;
+    if record(login, &mut outstanding) == WizardFlow::Stop {
+        return Ok((outstanding, true));
     }
 
-    println!("\nAll set. Check your miner anytime:");
-    println!("  $ gmcli status     # registration + product table");
-    println!("  $ gmcli earnings   # on-chain emission");
-    Ok(())
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    let keys = wizard_provider_keys(explicit_network, &cfg, assume_yes)?;
+    if record(keys, &mut outstanding) == WizardFlow::Stop {
+        return Ok((outstanding, true));
+    }
+
+    let cfg = load_config(explicit_network, api_url.clone())?;
+    if record(wizard_deploy(cfg, assume_yes).await?, &mut outstanding) == WizardFlow::Stop {
+        return Ok((outstanding, true));
+    }
+
+    let cfg = load_config(explicit_network, api_url)?;
+    let declare = wizard_declare_products(cfg, assume_yes).await?;
+    if record(declare, &mut outstanding) == WizardFlow::Stop {
+        return Ok((outstanding, true));
+    }
+
+    Ok((outstanding, false))
 }
 
 /// Wizard step 1: register the serving hotkey.
@@ -140,7 +232,7 @@ pub(crate) async fn cmd_init(
 /// asked whether they already registered a hotkey elsewhere:
 /// - Yes → prompt for their ss58; use the bring-your-own path.
 /// - No  → prompt for wallet/hotkey name; use the assisted path.
-fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> {
+fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<StepOutcome> {
     let title = "Step 1/5 · register hotkey";
     if hotkey_step_done(cfg) {
         let detail = cfg.registered_hotkey().map_or_else(
@@ -148,7 +240,7 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
             |record| format!("hotkey {} recorded", record.ss58),
         );
         gm_miner_cli::wizard::already_done(title, &detail);
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Done);
     }
 
     let network = cfg.resolved_network();
@@ -156,7 +248,9 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
         // Miner has a hotkey registered elsewhere — collect the ss58 and record it.
         let Some(ss58) = prompt_byo_ss58(assume_yes)? else {
             println!("  Run `gmcli register-hotkey --hotkey-ss58 <addr>` when ready.");
-            return Ok(WizardFlow::Continue);
+            return Ok(StepOutcome::Outstanding(
+                "gmcli register-hotkey --hotkey-ss58 <addr>".to_owned(),
+            ));
         };
         let command = describe_register_command(Some(&ss58), None, None);
         return run_wizard_step!(
@@ -174,7 +268,7 @@ fn wizard_register_hotkey(cfg: &Config, assume_yes: bool) -> Result<WizardFlow> 
             title,
             "skipped (no input) — run `gmcli register-hotkey` when ready",
         );
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Outstanding("gmcli register-hotkey".to_owned()));
     };
     let command = describe_register_command(None, Some(&wallet), hotkey.as_deref());
     run_wizard_step!(
@@ -236,18 +330,18 @@ async fn wizard_login(
     explicit_network: Option<Network>,
     api_url: Option<String>,
     assume_yes: bool,
-) -> Result<WizardFlow> {
+) -> Result<StepOutcome> {
     let title = "Step 2/5 · login";
     let cfg = load_config(explicit_network, api_url.clone())?;
     if has_valid_login(&cfg) {
         gm_miner_cli::wizard::already_done(title, "a valid login token is stored");
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Done);
     }
     // Login is a browser device-code flow — it cannot run unattended, so a
     // non-interactive run skips it with guidance rather than hanging.
     if assume_yes {
         gm_miner_cli::wizard::already_done(title, "skipped — run `gmcli login` interactively");
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Outstanding("gmcli login".to_owned()));
     }
     run_wizard_step!(
         title,
@@ -263,14 +357,14 @@ async fn wizard_login(
 /// with a pointer to `gmcli worker add` (the correct command for more
 /// capacity); the wizard never re-runs `deploy` over a registered worker #1,
 /// which would replace its registry endpoint.
-async fn wizard_deploy(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
+async fn wizard_deploy(cfg: Config, assume_yes: bool) -> Result<StepOutcome> {
     let title = "Step 4/5 · deploy worker";
     if has_deployed_worker(&cfg) {
         gm_miner_cli::wizard::already_done(
             title,
             "worker #1 is already deployed (add more with `gmcli worker add`)",
         );
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Done);
     }
     // `cmd_deploy` refuses without a provider key (it bakes them into the CVM
     // env). If the keys step was skipped, a deploy would fail immediately —
@@ -280,7 +374,7 @@ async fn wizard_deploy(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
             title,
             "skipped — deploy needs a provider key first (`gmcli set-api-keys`)",
         );
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Outstanding("gmcli deploy".to_owned()));
     }
     let mut flags = default_deploy_flags();
     flags.yes = assume_yes;
@@ -298,11 +392,11 @@ fn wizard_provider_keys(
     explicit_network: Option<Network>,
     cfg: &Config,
     assume_yes: bool,
-) -> Result<WizardFlow> {
+) -> Result<StepOutcome> {
     let title = "Step 3/5 · provider keys";
     if provider_keys_done(cfg) {
         gm_miner_cli::wizard::already_done(title, "provider keys already set");
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Done);
     }
     let keys = prompt_provider_keys(assume_yes)?;
     if keys.anthropic.is_none()
@@ -315,7 +409,7 @@ fn wizard_provider_keys(
         && keys.kubetee.is_none()
     {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Outstanding("gmcli set-api-keys".to_owned()));
     }
     let command = describe_keys_command(&keys);
     run_wizard_step!(
@@ -435,29 +529,28 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
 }
 
 /// Wizard step 5: declare products across the catalog at one discount.
-async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<WizardFlow> {
+async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<StepOutcome> {
     let title = "Step 5/5 · declare products";
     let Some(discount_bp) = prompt_discount(assume_yes)? else {
         println!("  No discount entered — skipping. Declare later with `gmcli declare-products --discount-pct <pct>`.");
-        return Ok(WizardFlow::Continue);
+        return Ok(StepOutcome::Outstanding(
+            "gmcli declare-products --discount-pct <pct>".to_owned(),
+        ));
     };
     let pct = format_discount_pct(discount_bp);
     let command = format!("gmcli declare-products --discount-pct {pct}");
-    // Not `run_wizard_step!`: that macro discards the step's value, and this
-    // step has a third outcome. The miner can accept the step, read the prices
-    // the discount works out to, and then decline — at which point nothing was
-    // declared and saying so is the whole point of having asked.
+    // Not `run_wizard_step!`: that macro treats a completed `Run` as `Done`,
+    // and this step has a fourth path. The miner can accept the step, read the
+    // prices the discount works out to, and then decline the confirmation — at
+    // which point nothing was declared, and the run is no more finished than
+    // if they had skipped the step outright.
     match ask_step(title, &command, assume_yes)? {
-        StepChoice::Run => {
-            if declare_all_products(cfg, discount_bp, assume_yes).await?
-                == DeclareOutcome::Cancelled
-            {
-                println!("  Step skipped — no offers declared. Run `{command}` when ready.");
-            }
-            Ok(WizardFlow::Continue)
-        }
-        StepChoice::Skip => Ok(WizardFlow::Continue),
-        StepChoice::Stop => Ok(WizardFlow::Stop),
+        StepChoice::Run => match declare_all_products(cfg, discount_bp, assume_yes).await? {
+            DeclareOutcome::Declared => Ok(StepOutcome::Done),
+            DeclareOutcome::Cancelled => Ok(StepOutcome::Outstanding(command)),
+        },
+        StepChoice::Skip => Ok(StepOutcome::Outstanding(command)),
+        StepChoice::Stop => Ok(StepOutcome::Stop),
     }
 }
 
@@ -487,4 +580,121 @@ fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
     parse_discount_pct(&raw)
         .map(Some)
         .map_err(|e| anyhow::anyhow!(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{closing_lines, record, StepOutcome, WizardFlow};
+
+    /// The banner that must appear if and only if onboarding actually finished.
+    const SUCCESS_BANNER: &str = "All set";
+
+    fn outstanding_after(outcomes: Vec<StepOutcome>) -> Vec<String> {
+        let mut outstanding = Vec::new();
+        for outcome in outcomes {
+            assert_eq!(record(outcome, &mut outstanding), WizardFlow::Continue);
+        }
+        outstanding
+    }
+
+    #[test]
+    fn a_run_where_every_step_ran_is_the_only_one_that_claims_success() {
+        let rendered =
+            closing_lines(&outstanding_after(vec![StepOutcome::Done; 5]), false).join("\n");
+        assert!(rendered.contains(SUCCESS_BANNER), "{rendered}");
+        assert!(rendered.contains("gmcli status"), "{rendered}");
+    }
+
+    #[test]
+    fn a_skipped_step_suppresses_the_success_banner() {
+        // The bug this pins: the wizard printed the skip notice *and then* the
+        // success banner, so a miner left onboarding believing offers were
+        // live. Asserting the skip line alone passes against that exact bug —
+        // the absence of the banner is the assertion that matters.
+        let outstanding = outstanding_after(vec![
+            StepOutcome::Done,
+            StepOutcome::Done,
+            StepOutcome::Done,
+            StepOutcome::Done,
+            StepOutcome::Outstanding("gmcli declare-products --discount-pct 5".to_owned()),
+        ]);
+        let rendered = closing_lines(&outstanding, false).join("\n");
+
+        assert!(
+            !rendered.contains(SUCCESS_BANNER),
+            "a run that declared nothing must not claim success:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Not finished — 1 step(s) still to do:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  $ gmcli declare-products --discount-pct 5"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_outstanding_step_is_named_with_the_command_that_finishes_it() {
+        let outstanding = outstanding_after(vec![
+            StepOutcome::Outstanding("gmcli login".to_owned()),
+            StepOutcome::Done,
+            StepOutcome::Outstanding("gmcli set-api-keys".to_owned()),
+            StepOutcome::Outstanding("gmcli deploy".to_owned()),
+            StepOutcome::Done,
+        ]);
+        let rendered = closing_lines(&outstanding, false).join("\n");
+
+        assert!(!rendered.contains(SUCCESS_BANNER), "{rendered}");
+        assert!(rendered.contains("3 step(s) still to do"), "{rendered}");
+        for command in ["gmcli login", "gmcli set-api-keys", "gmcli deploy"] {
+            assert!(rendered.contains(&format!("  $ {command}")), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn stopping_partway_never_claims_success_and_does_not_imply_a_full_list() {
+        // `n` leaves the later steps unattempted, so the outstanding list is
+        // partial — the copy must not read as "here is everything left".
+        let mut outstanding = Vec::new();
+        assert_eq!(
+            record(
+                StepOutcome::Outstanding("gmcli login".to_owned()),
+                &mut outstanding
+            ),
+            WizardFlow::Continue
+        );
+        assert_eq!(
+            record(StepOutcome::Stop, &mut outstanding),
+            WizardFlow::Stop
+        );
+
+        let rendered = closing_lines(&outstanding, true).join("\n");
+        assert!(!rendered.contains(SUCCESS_BANNER), "{rendered}");
+        assert!(
+            rendered.contains("the remaining steps were not attempted"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  $ gmcli login"), "{rendered}");
+        assert!(rendered.contains("Re-run `gmcli init`"), "{rendered}");
+        assert!(!rendered.contains("still to do"), "{rendered}");
+    }
+
+    #[test]
+    fn stopping_at_the_very_first_step_prints_no_empty_outstanding_block() {
+        let rendered = closing_lines(&[], true).join("\n");
+        assert!(!rendered.contains(SUCCESS_BANNER), "{rendered}");
+        assert!(!rendered.contains("Outstanding from"), "{rendered}");
+        assert!(rendered.contains("Re-run `gmcli init`"), "{rendered}");
+    }
+
+    #[test]
+    fn a_done_step_records_nothing() {
+        let mut outstanding = Vec::new();
+        assert_eq!(
+            record(StepOutcome::Done, &mut outstanding),
+            WizardFlow::Continue
+        );
+        assert!(outstanding.is_empty());
+    }
 }

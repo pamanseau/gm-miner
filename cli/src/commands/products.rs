@@ -134,7 +134,7 @@ fn sent_as_lines(discount_pct: &str, width: usize) -> [String; 2] {
 pub(crate) struct DeclareArgs<'a> {
     /// Upstream deployment/model id for a cloud-backed offer.
     pub(crate) upstream_model: Option<&'a str>,
-    /// Skip the price confirmation (`--yes`, or a non-interactive stdin).
+    /// Skip the discount confirmation (`--yes`, or a non-interactive stdin).
     pub(crate) assume_yes: bool,
 }
 

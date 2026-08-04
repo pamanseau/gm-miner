@@ -390,6 +390,11 @@ enum Command {
     /// on the buyer product's retail, which the output names. For batch
     /// declarations against the whole catalog (or one provider's slice), use
     /// `declare-products`.
+    ///
+    /// Before sending, prints what the discount works out to per Mtok on
+    /// every dimension the product prices — input and output, plus prompt
+    /// cache, audio and long-context rates where the model has them — and
+    /// asks you to confirm the discount.
     #[command(after_help = "Examples:\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5\n  \
         gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-pct 5 --upstream-model us.anthropic.claude-sonnet-4-6-v1\n  \
@@ -411,16 +416,21 @@ enum Command {
         upstream_model: Option<String>,
 
         /// Percent off retail; range [0, 99.90]. You will receive
-        /// (100 - PCT)% of retail per token (e.g. `--discount-pct 10.5`
-        /// means you keep 89.5% of every per-Mtok dollar). `0` is at
-        /// retail; the `99.90` cap keeps the per-request revenue
-        /// strictly positive.
+        /// (100 - PCT)% of retail on every dimension the product prices
+        /// (e.g. `--discount-pct 10.5` means you keep 89.5% of every
+        /// per-Mtok dollar, on input, output, and any cache, audio or
+        /// long-context rate the model carries). `0` is at retail; the
+        /// `99.90` cap keeps the per-request revenue strictly positive.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
 
-        /// Skip the confirmation of the resolved per-dimension prices.
-        /// A non-interactive stdin skips it too, so scripted declarations
-        /// keep working without this flag.
+        /// Skip the confirmation prompt. A non-interactive stdin skips it
+        /// too, so scripted declarations keep working without this flag.
+        ///
+        /// The prompt confirms the discount, which is what is sent. The
+        /// per-dimension prices printed above it are what that discount
+        /// works out to at the retail this run fetched — the registry
+        /// resolves them against its own retail when it records the offer.
         #[arg(long)]
         yes: bool,
     },
@@ -431,6 +441,9 @@ enum Command {
     /// by `--provider` when set, then POSTs one offer per surviving entry.
     /// Per-product failures are reported individually and do not abort the
     /// loop — the final summary lists ok/err counts.
+    ///
+    /// Lists what the discount works out to on every target before sending,
+    /// and asks you to confirm the discount once for the whole batch.
     #[command(after_help = "Examples:\n  \
         gmcli declare-products --discount-pct 5            # whole catalog\n  \
         gmcli declare-products --provider openai --discount-pct 10")]
@@ -441,14 +454,18 @@ enum Command {
         provider: Option<Provider>,
 
         /// Percent off retail; range [0, 99.90]. You will receive
-        /// (100 - PCT)% of retail per token, applied to every product
-        /// the fan-out touches.
+        /// (100 - PCT)% of retail on every dimension each product prices,
+        /// applied to every product the fan-out touches.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
 
-        /// Skip the confirmation of the resolved per-dimension prices.
-        /// A non-interactive stdin skips it too, so scripted declarations
-        /// keep working without this flag.
+        /// Skip the confirmation prompt. A non-interactive stdin skips it
+        /// too, so scripted declarations keep working without this flag.
+        ///
+        /// The prompt confirms the discount, which is what is sent. The
+        /// per-dimension prices printed above it are what that discount
+        /// works out to at the retail this run fetched — the registry
+        /// resolves them against its own retail when it records the offer.
         #[arg(long)]
         yes: bool,
     },
@@ -501,10 +518,11 @@ enum Command {
 
     /// Show the miner's current registration status and per-product eligibility.
     ///
-    /// Lists each declared offer with the per-Mtok rate you actually receive
-    /// after the discount, plus whether it is offered and eligible. Every
-    /// ineligible offer is listed underneath the table with the registry's
-    /// reason and what to do about it.
+    /// Lists each declared offer with the per-Mtok rate you receive at
+    /// current retail, plus whether it is offered and eligible. An offer
+    /// priced beyond input and output is marked `(+N more)` and its other
+    /// dimensions are listed under the table. Every ineligible offer is
+    /// listed underneath with the registry's reason and what to do about it.
     #[command(after_help = "Examples:\n  \
         gmcli status\n  \
         gmcli --network testnet status")]
