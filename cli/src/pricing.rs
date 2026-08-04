@@ -9,11 +9,10 @@
 //! see [`effective_dimensions`]. [`PRICE_DIMENSIONS`] is the one list of
 //! dimensions the arithmetic and the rendering both walk.
 
-use std::fmt::Write as _;
-
 use anyhow::Result;
 
 use crate::network::Network;
+use crate::table;
 use crate::types::{ProductCompetitiveness, RetailDimensions};
 
 /// Inclusive upper bound on `discount_bp`. The registry's pydantic schema
@@ -380,58 +379,46 @@ pub fn render_pricing(network: Network, products: &[ProductCompetitiveness]) -> 
     lines
 }
 
-const RANK_COLUMNS: [(&str, usize); 7] = [
-    ("PROVIDER", 12),
-    ("MODEL", 32),
-    ("YOUR RANK", 12),
-    ("DISCOUNT", 10),
-    ("YOUR COST", 12),
-    ("BEST", 12),
-    ("MEDIAN", 12),
+const RANK_HEADERS: [&str; 7] = [
+    "PROVIDER",
+    "MODEL",
+    "YOUR RANK",
+    "DISCOUNT",
+    "YOUR COST",
+    "BEST",
+    "MEDIAN",
 ];
 
-fn rank_row(cells: &[String; 7]) -> String {
-    let mut row = String::new();
-    for (i, ((_, width), cell)) in RANK_COLUMNS.iter().zip(cells).enumerate() {
-        if i > 0 {
-            row.push(' ');
-        }
-        let _ = write!(row, "{cell:<width$}");
-    }
-    row
-}
-
-fn rank_rule() -> String {
-    let cells: usize = RANK_COLUMNS.iter().map(|&(_, width)| width).sum();
-    "-".repeat(cells + RANK_COLUMNS.len() - 1)
-}
-
+/// The rank table, sized to its content by [`table::render`].
+///
+/// The three cost columns held 12 characters, which was ample while
+/// [`format_usd`] truncated at three decimal places. It no longer does — a
+/// cheap model's cost is `$0.000894999` — so a fixed width here would push
+/// `BEST` and `MEDIAN` off their headers in the view whose entire job is
+/// comparing those numbers.
 fn rank_table(yours: &[&ProductCompetitiveness]) -> Vec<String> {
-    let header = RANK_COLUMNS.map(|(name, _)| name.to_owned());
-    let mut lines = vec![rank_row(&header), rank_rule()];
-    for p in yours {
-        let rank = p.your_rank.map_or_else(
-            || "—".to_owned(),
-            |rank| format!("{rank} of {}", p.competitor_count),
-        );
-        let discount = p.your_discount_bp.map_or_else(
-            || "—".to_owned(),
-            |bp| format!("{}%", format_discount_pct(bp)),
-        );
-        let your_cost = p
-            .your_cost_ndollars
-            .map_or_else(|| "—".to_owned(), format_usd);
-        lines.push(rank_row(&[
-            p.provider.clone(),
-            p.model.clone(),
-            rank,
-            discount,
-            your_cost,
-            format_usd(p.best_cost_ndollars),
-            format_usd(p.median_cost_ndollars),
-        ]));
-    }
-    lines
+    let rows: Vec<Vec<String>> = yours
+        .iter()
+        .map(|p| {
+            vec![
+                p.provider.clone(),
+                p.model.clone(),
+                p.your_rank.map_or_else(
+                    || "—".to_owned(),
+                    |rank| format!("{rank} of {}", p.competitor_count),
+                ),
+                p.your_discount_bp.map_or_else(
+                    || "—".to_owned(),
+                    |bp| format!("{}%", format_discount_pct(bp)),
+                ),
+                p.your_cost_ndollars
+                    .map_or_else(|| "—".to_owned(), format_usd),
+                format_usd(p.best_cost_ndollars),
+                format_usd(p.median_cost_ndollars),
+            ]
+        })
+        .collect();
+    table::render(&RANK_HEADERS, &rows)
 }
 
 fn field_line(p: &ProductCompetitiveness) -> String {
@@ -523,8 +510,8 @@ mod tests {
     use super::{
         effective_dimensions, effective_per_mtok_ndollars, effective_rate_summary,
         extra_dimension_count, extra_dimension_lines, format_discount_pct, format_usd,
-        parse_discount_pct, rank_row, rank_rule, render_pricing, Network, ProductCompetitiveness,
-        MAX_DISCOUNT_BP, PRICE_DIMENSIONS, RANK_COLUMNS,
+        parse_discount_pct, rank_table, render_pricing, Network, ProductCompetitiveness,
+        MAX_DISCOUNT_BP, PRICE_DIMENSIONS,
     };
     use crate::types::RetailDimensions;
 
@@ -708,9 +695,56 @@ mod tests {
     }
 
     #[test]
-    fn the_rank_rule_is_exactly_as_wide_as_a_row() {
-        let row = rank_row(&RANK_COLUMNS.map(|(name, _)| name.to_owned()));
-        assert_eq!(rank_rule().chars().count(), row.chars().count());
+    fn every_rank_row_is_the_width_of_the_rule_not_just_the_header() {
+        // The old test compared the rule against the *header* row only, which
+        // holds however far the data rows overflow — that is why the fixed
+        // 12-char cost columns survived unnoticed once prices stopped being
+        // truncated to three decimals. Assert every line.
+        let field = products(serde_json::json!([
+            {
+                "provider": "chutes", "model": "a-very-cheap-model-with-a-long-id",
+                "competitor_count": 3,
+                "best_cost_ndollars": 999_999_u64,
+                "median_cost_ndollars": 1_999_999_u64,
+                "offered_by_you": true,
+                "your_cost_ndollars": 1_999_998_u64,
+                "your_discount_bp": 500,
+                "your_rank": 2,
+            },
+            {
+                "provider": "anthropic", "model": "claude-sonnet-4-6",
+                "competitor_count": 5,
+                "best_cost_ndollars": 16_200_000_000_u64,
+                "median_cost_ndollars": 18_000_000_000_u64,
+                "offered_by_you": true,
+                "your_cost_ndollars": 18_000_000_000_u64,
+                "your_discount_bp": 500,
+                "your_rank": 3,
+            },
+        ]));
+        let lines = rank_table(&field.iter().collect::<Vec<_>>());
+
+        let width = lines[0].chars().count();
+        for line in &lines {
+            assert_eq!(
+                line.chars().count(),
+                width,
+                "row is not the table's width:\n{}",
+                lines.join("\n")
+            );
+        }
+
+        // The widest cost cell is present in full, and MEDIAN still starts
+        // where its header does on every row.
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("$0.001999998"), "{rendered}");
+        assert!(rendered.contains("$0.000999999"), "{rendered}");
+        let median_at = lines[0].find("MEDIAN").expect("the header names MEDIAN");
+        assert!(
+            lines[2][median_at..].starts_with("$0.001999999"),
+            "{rendered}"
+        );
+        assert!(lines[3][median_at..].starts_with("$18.000"), "{rendered}");
     }
 
     #[test]

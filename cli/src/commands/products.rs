@@ -2,8 +2,6 @@
 //! `declare-products`, their `undeclare-` counterparts, and `status` (which
 //! folds in the product table).
 
-use std::fmt::Write as _;
-
 use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
@@ -13,6 +11,7 @@ use gm_miner_cli::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
         format_usd,
     },
+    table,
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest,
         ProductOfferStatus, Provider, RetailDimensions, SourceProduct,
@@ -612,61 +611,6 @@ const STATUS_HEADERS: [&str; 6] = [
     "ELIGIBLE",
 ];
 
-/// Header, rule and rows, with every column sized to its own widest cell.
-///
-/// Fixed widths were the bug: a rate cell is now
-/// `$0.000999999 in / $0.000000999 out per Mtok (+8 more)` for a cheap model
-/// with a full price vector, and any constant picked against a `$3.000`
-/// example overflows and shunts `OFFERED`/`ELIGIBLE` off their headers — for
-/// exactly the small-price products this rendering exists to clarify. Sizing
-/// from the data cannot be outgrown.
-///
-/// Widths are counted in Unicode scalars, which is exactly what `{:<width$}`
-/// pads by, so header, rule and every row come out the same length no matter
-/// what the cells contain. That equals *terminal columns* only for characters
-/// one column wide. The assumption is that every cell here is ASCII, and each
-/// one is: the provider is a fixed enum, the discount and the yes/no cells are
-/// generated, the rate cell is digits and `$./` — and the model id is a
-/// provider's own API identifier, which has to survive being interpolated into
-/// the `/miners/products/{provider}/{model}` path. `product.json` puts no
-/// `pattern` on the model field, so this is a property of the catalog rather
-/// than a guarantee of the contract; a wide-glyph slug would misalign the
-/// columns after it and nothing worse. `unicode-width` is not worth a
-/// dependency for a cosmetic defect on a case that cannot currently arise —
-/// revisit if a non-ASCII slug ever reaches the catalog.
-fn status_table_lines(rows: &[[String; 6]]) -> Vec<String> {
-    let mut widths = STATUS_HEADERS.map(str::len);
-    for row in rows {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-
-    let render = |cells: &[&str]| -> String {
-        let mut row = String::new();
-        for (i, (width, cell)) in widths.iter().zip(cells).enumerate() {
-            if i > 0 {
-                row.push(' ');
-            }
-            let _ = write!(row, "{cell:<width$}");
-        }
-        // Every column is padded, including the last, so header, rule and
-        // every row are the same width — which is the property the test
-        // asserts against the rendered output.
-        row
-    };
-
-    let mut lines = vec![
-        render(&STATUS_HEADERS),
-        "-".repeat(widths.iter().sum::<usize>() + widths.len() - 1),
-    ];
-    lines.extend(rows.iter().map(|row| {
-        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
-        render(&cells)
-    }));
-    lines
-}
-
 /// The catalog retail vector for each product, keyed by (provider, model).
 type RetailByKey<'a> = std::collections::HashMap<(Provider, &'a str), &'a RetailDimensions>;
 
@@ -688,7 +632,10 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         .collect();
 
     println!("\nProducts:");
-    for line in status_table_lines(&status_rows(&miner.products, &retail_by_key)) {
+    for line in table::render(
+        &STATUS_HEADERS,
+        &status_rows(&miner.products, &retail_by_key),
+    ) {
         println!("{line}");
     }
     println!("\n{} offer(s) total.", miner.products.len());
@@ -708,7 +655,7 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
 /// An offer whose product the catalog does not carry — a sourcing route, or a
 /// product withdrawn since — keeps its row with the rate marked unknown rather
 /// than being dropped from a table headed "your offers".
-fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<[String; 6]> {
+fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<Vec<String>> {
     offers
         .iter()
         .map(|offer| {
@@ -725,7 +672,7 @@ fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -
                     ),
                     _ => ("—".to_owned(), "—".to_owned()),
                 };
-            [
+            vec![
                 offer.provider.clone(),
                 offer.model.clone(),
                 discount_label,
@@ -1158,7 +1105,7 @@ mod tests {
             ])),
             &retail_by_key,
         );
-        let lines = status_table_lines(&rows);
+        let lines = table::render(&STATUS_HEADERS, &rows);
 
         let width = lines[0].chars().count();
         for line in &lines {
@@ -1186,7 +1133,7 @@ mod tests {
             );
         }
         // Byte-indexing the rendered line above is only sound because every
-        // cell is ASCII — see `status_table_lines`. This pins that assumption
+        // cell is ASCII — see `table::render`. This pins that assumption
         // rather than leaving it implicit: a non-ASCII model id would make
         // widths (Unicode scalars) diverge from terminal columns, and would
         // also make `eligible_at` a byte offset into the middle of a
