@@ -65,7 +65,7 @@ use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
 use crate::commands::pricing::cmd_pricing;
 use crate::commands::products::{
     cmd_declare_product, cmd_declare_products, cmd_status, cmd_undeclare_product,
-    cmd_undeclare_products,
+    cmd_undeclare_products, DeclareArgs,
 };
 use crate::commands::sources::cmd_sources;
 use crate::commands::streaming_check::cmd_check_streaming;
@@ -417,6 +417,12 @@ enum Command {
         /// strictly positive.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
+
+        /// Skip the confirmation of the resolved per-dimension prices.
+        /// A non-interactive stdin skips it too, so scripted declarations
+        /// keep working without this flag.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Fan a single discount out across multiple offers.
@@ -439,6 +445,12 @@ enum Command {
         /// the fan-out touches.
         #[arg(long = "discount-pct", value_name = "PCT", value_parser = parse_discount_pct)]
         discount_bp: u32,
+
+        /// Skip the confirmation of the resolved per-dimension prices.
+        /// A non-interactive stdin skips it too, so scripted declarations
+        /// keep working without this flag.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Withdraw a single miner-product offer.
@@ -885,6 +897,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             model,
             upstream_model,
             discount_bp,
+            yes,
         } => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
@@ -894,18 +907,22 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 &provider,
                 &model,
                 discount_bp,
-                upstream_model.as_deref(),
+                DeclareArgs {
+                    upstream_model: upstream_model.as_deref(),
+                    assume_yes: yes,
+                },
             )
             .await
         }
         Command::DeclareProducts {
             provider,
             discount_bp,
+            yes,
         } => {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_products(&mut client, provider.as_ref(), discount_bp).await
+            cmd_declare_products(&mut client, provider.as_ref(), discount_bp, yes).await
         }
         Command::UndeclareProduct { provider, model } => {
             let cfg = load_config(explicit_network, api_url)?;
@@ -1043,6 +1060,7 @@ mod tests {
                 dimensions: RetailDimensions {
                     input_per_mtok_ndollars: 3_000_000_000,
                     output_per_mtok_ndollars: 15_000_000_000,
+                    ..Default::default()
                 },
             },
         }

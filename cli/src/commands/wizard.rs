@@ -447,7 +447,7 @@ async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<Wizard
         title,
         &command,
         assume_yes,
-        declare_all_products(cfg, discount_bp).await
+        declare_all_products(cfg, discount_bp, assume_yes).await
     )
 }
 
@@ -455,9 +455,9 @@ async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<Wizard
 /// refresh is folded in here (the wizard's other steps go through `dispatch`,
 /// which refreshes before the command; the declare step calls the command
 /// directly, so it does its own refresh).
-async fn declare_all_products(cfg: Config, discount_bp: u32) -> Result<()> {
+async fn declare_all_products(cfg: Config, discount_bp: u32, assume_yes: bool) -> Result<()> {
     let mut client = gm_miner_cli::client::RegistryClient::new(ensure_fresh_token(cfg).await?);
-    cmd_declare_products(&mut client, None, discount_bp).await
+    cmd_declare_products(&mut client, None, discount_bp, assume_yes).await
 }
 
 /// Prompt for the catalog-wide discount percent, parsed into basis points.

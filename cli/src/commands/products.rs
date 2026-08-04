@@ -2,12 +2,15 @@
 //! `declare-products`, their `undeclare-` counterparts, and `status` (which
 //! folds in the product table).
 
+use std::fmt::Write as _;
+
 use anyhow::{bail, Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
+    dependency::confirm,
     pricing::{
-        effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct,
+        effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
         format_per_mtok_usd,
     },
     types::{
@@ -31,12 +34,16 @@ use crate::commands::{get_me_json, sources::fetch_sources, status_error};
 /// A product the catalog does not carry may still be a sourcing route — the
 /// registry keeps those out of the buyer-facing `GET /products` — so the
 /// miner's routes are consulted before the declaration is rejected.
+///
+/// The resolved per-dimension prices are printed and confirmed *before* the
+/// POST: `--discount-pct` is input ergonomics, and what the miner commits to
+/// is the absolute vector it resolves to.
 pub(crate) async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
     model: &str,
     discount_bp: u32,
-    upstream_model: Option<&str>,
+    args: DeclareArgs<'_>,
 ) -> Result<()> {
     let catalog = fetch_catalog(client).await?;
     let catalog_hit = catalog
@@ -45,7 +52,6 @@ pub(crate) async fn cmd_declare_product(
         .find(|p| &p.provider == provider && p.model == model);
 
     let lines = if let Some(product) = catalog_hit {
-        post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
         declaration_lines(
             &format!("{provider}/{model}"),
             "Retail",
@@ -54,15 +60,34 @@ pub(crate) async fn cmd_declare_product(
         )
     } else {
         let source = resolve_source(client, provider, model).await?;
-        post_declare_product(client, provider, model, discount_bp, upstream_model).await?;
         source_declaration_lines(provider, model, &source, discount_bp)
     };
 
     for line in lines {
         println!("{line}");
     }
+    if !confirm("Declare at these prices?", true, args.assume_yes)? {
+        println!("Not declared — nothing was sent.");
+        return Ok(());
+    }
+
+    post_declare_product(client, provider, model, discount_bp, args.upstream_model).await?;
+    println!("  → ok");
     println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
+}
+
+/// The non-pricing arguments of a single declaration.
+///
+/// Grouped so `cmd_declare_product` keeps to five positional parameters as the
+/// declaration gains inputs; both fields are about *how* to declare rather
+/// than what the offer costs.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DeclareArgs<'a> {
+    /// Upstream deployment/model id for a cloud-backed offer.
+    pub(crate) upstream_model: Option<&'a str>,
+    /// Skip the price confirmation (`--yes`, or a non-interactive stdin).
+    pub(crate) assume_yes: bool,
 }
 
 /// The declaration summary for a sourcing route: the buyer-retail economics,
@@ -119,12 +144,15 @@ async fn resolve_source(
         })
 }
 
-/// The declaration summary: retail, the declared discount, and the per-Mtok
-/// rate the miner receives.
+/// The declaration preview: retail, the declared discount, and the absolute
+/// per-Mtok rate the miner receives on every dimension the product prices.
 ///
 /// `retail_label` names *which* retail the numbers are. A sourcing route
 /// settles on the buyer product's retail, not the upstream's, and the miner
 /// has to be able to tell the two apart on sight.
+///
+/// The dimensions beyond input/output are listed only when the product prices
+/// them, so a two-dimension product renders in three lines exactly as before.
 fn declaration_lines(
     header: &str,
     retail_label: &str,
@@ -132,22 +160,17 @@ fn declaration_lines(
     discount_bp: u32,
 ) -> Vec<String> {
     let width = retail_label.len().max("You receive".len()) + 2;
+    let effective = effective_dimensions(retail, discount_bp);
     let retail_in = format_per_mtok_usd(retail.input_per_mtok_ndollars);
     let retail_out = format_per_mtok_usd(retail.output_per_mtok_ndollars);
-    let eff_in = format_per_mtok_usd(effective_per_mtok_ndollars(
-        retail.input_per_mtok_ndollars,
-        discount_bp,
-    ));
-    let eff_out = format_per_mtok_usd(effective_per_mtok_ndollars(
-        retail.output_per_mtok_ndollars,
-        discount_bp,
-    ));
+    let eff_in = format_per_mtok_usd(effective.input_per_mtok_ndollars);
+    let eff_out = format_per_mtok_usd(effective.output_per_mtok_ndollars);
     // What the miner keeps per token, as a percentage of retail. With
     // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
     // "0.1% of retail" — the minimum positive payout.
     let kept_pct = format_discount_pct(10_000_u32.saturating_sub(discount_bp));
 
-    vec![
+    let mut lines = vec![
         header.to_owned(),
         format!("  {retail_label:<width$}: {retail_in} input / {retail_out} output per Mtok"),
         format!(
@@ -159,8 +182,16 @@ fn declaration_lines(
             "  {:<width$}: {eff_in} input / {eff_out} output per Mtok ({kept_pct}% of retail)",
             "You receive"
         ),
-        "  → ok".to_owned(),
-    ]
+    ];
+    let extras = extra_dimension_lines(retail, discount_bp);
+    if !extras.is_empty() {
+        lines.push(format!(
+            "  {:<width$}: {retail_label} → you receive, per Mtok",
+            "Also priced"
+        ));
+        lines.extend(extras);
+    }
+    lines
 }
 
 /// `gmcli declare-products` — fan a single discount out over the catalog.
@@ -168,9 +199,11 @@ fn declaration_lines(
 /// 1. Public `GET /products` discovers every active product.
 /// 2. If `provider_filter` is set, drops products from other providers.
 /// 3. Drops deprecated products (the registry rejects offers on them anyway).
-/// 4. POSTs one offer per surviving product. Each result is printed
+/// 4. Prints the resolved per-dimension prices for every target and asks the
+///    miner to confirm them, because those absolutes are what the offer is.
+/// 5. POSTs one offer per surviving product. Each result is printed
 ///    individually (`provider/model: N% → ok|ERROR …`).
-/// 5. Reports a final ok/err summary.
+/// 6. Reports a final ok/err summary.
 ///
 /// Per-product failures do not abort the loop. The function returns `Ok(())`
 /// when every POST succeeded and an aggregated error otherwise so the CLI
@@ -184,6 +217,7 @@ pub(crate) async fn cmd_declare_products(
     client: &mut RegistryClient,
     provider_filter: Option<&Provider>,
     discount_bp: u32,
+    assume_yes: bool,
 ) -> Result<()> {
     let catalog = fetch_catalog(client).await?;
     let targets = filter_catalog(&catalog.products, provider_filter);
@@ -194,31 +228,30 @@ pub(crate) async fn cmd_declare_products(
         bail!("no active products found in {scope} to declare against");
     }
 
-    let discount_pct = format_discount_pct(discount_bp);
-    println!(
-        "Declaring {discount_pct}% off retail on {} product(s)...",
-        targets.len()
-    );
+    for line in fan_out_preview_lines(&targets, discount_bp) {
+        println!("{line}");
+    }
+    if !confirm(
+        &format!("Declare {} offer(s) at these prices?", targets.len()),
+        true,
+        assume_yes,
+    )? {
+        println!("Not declared — nothing was sent.");
+        return Ok(());
+    }
 
     let mut ok_count = 0_usize;
     let mut err_count = 0_usize;
     for product in &targets {
-        let rate = effective_rate_summary(&product.retail_price.dimensions, discount_bp);
         match post_declare_product(client, &product.provider, &product.model, discount_bp, None)
             .await
         {
             Ok(()) => {
-                println!(
-                    "  {}/{}: {discount_pct}% off → {rate} → ok",
-                    product.provider, product.model
-                );
+                println!("  {}/{}: ok", product.provider, product.model);
                 ok_count += 1;
             }
             Err(err) => {
-                println!(
-                    "  {}/{}: {discount_pct}% off → {rate} → ERROR {err}",
-                    product.provider, product.model
-                );
+                println!("  {}/{}: ERROR {err}", product.provider, product.model);
                 err_count += 1;
             }
         }
@@ -230,6 +263,38 @@ pub(crate) async fn cmd_declare_products(
     }
     println!("Next: gmcli status   (confirm offers + eligibility)");
     Ok(())
+}
+
+/// What the fan-out is about to commit to, one product per line, with the
+/// dimensions beyond input/output listed beneath the products that price them.
+///
+/// The whole catalog at one discount is dozens of products; expanding all ten
+/// dimensions for each would bury the two that matter. Expanding only what a
+/// product actually prices keeps the common row to one line and still shows
+/// every absolute figure the miner is agreeing to.
+fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> {
+    let discount_pct = format_discount_pct(discount_bp);
+    let mut lines = vec![
+        format!(
+            "Declaring {discount_pct}% off retail on {} product(s). You would receive:",
+            targets.len()
+        ),
+        String::new(),
+    ];
+    for product in targets {
+        let dims = &product.retail_price.dimensions;
+        let effective = effective_dimensions(dims, discount_bp);
+        lines.push(format!(
+            "  {}/{}: {} in / {} out per Mtok",
+            product.provider,
+            product.model,
+            format_per_mtok_usd(effective.input_per_mtok_ndollars),
+            format_per_mtok_usd(effective.output_per_mtok_ndollars),
+        ));
+        lines.extend(extra_dimension_lines(dims, discount_bp));
+    }
+    lines.push(String::new());
+    lines
 }
 
 /// Issue one `POST /miners/products` and translate the result into a typed
@@ -475,13 +540,35 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     print_product_table(client, &miner).await
 }
 
+/// Column widths for the `status` product table, and the rule beneath it.
+const STATUS_COLUMNS: [usize; 6] = [12, 32, 10, 44, 8, 8];
+
+fn status_row(cells: &[&str; 6]) -> String {
+    let mut row = String::new();
+    for (i, (width, cell)) in STATUS_COLUMNS.iter().zip(cells).enumerate() {
+        if i > 0 {
+            row.push(' ');
+        }
+        let _ = write!(row, "{cell:<width$}");
+    }
+    row
+}
+
+fn status_rule() -> String {
+    let cells: usize = STATUS_COLUMNS.iter().sum();
+    "-".repeat(cells + STATUS_COLUMNS.len() - 1)
+}
+
+/// The catalog retail vector for each product, keyed by (provider, model).
+type RetailByKey<'a> = std::collections::HashMap<(Provider, &'a str), &'a RetailDimensions>;
+
 /// Render the per-offer table joining `/miners/me` offers against the public
 /// catalog so each row shows the effective per-Mtok rate the miner receives.
 async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -> Result<()> {
     // The catalog is the single source of truth for retail; join here rather
     // than adding a retail block to `/miners/me` on the registry side.
     let catalog = fetch_catalog(client).await?;
-    let retail_by_key: std::collections::HashMap<_, _> = catalog
+    let retail_by_key: RetailByKey<'_> = catalog
         .products
         .iter()
         .map(|p| {
@@ -494,10 +581,17 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
 
     println!("\nProducts:");
     println!(
-        "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
-        "PROVIDER", "MODEL", "DISCOUNT", "YOU RECEIVE / MTOK", "OFFERED", "ELIGIBLE"
+        "{}",
+        status_row(&[
+            "PROVIDER",
+            "MODEL",
+            "DISCOUNT",
+            "YOU RECEIVE / MTOK",
+            "OFFERED",
+            "ELIGIBLE"
+        ])
     );
-    println!("{}", "-".repeat(110));
+    println!("{}", status_rule());
     for p in &miner.products {
         let provider: Result<Provider, _> = p.provider.parse();
         let (discount_label, rate_label) = match (p.discount_bp, provider) {
@@ -512,21 +606,61 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
             _ => ("—".to_owned(), "—".to_owned()),
         };
         println!(
-            "{:<12} {:<32} {:<10} {:<38} {:<8} {:<8}",
-            p.provider,
-            p.model,
-            discount_label,
-            rate_label,
-            if p.is_offered { "yes" } else { "no" },
-            if p.is_eligible { "yes" } else { "no" },
+            "{}",
+            status_row(&[
+                &p.provider,
+                &p.model,
+                &discount_label,
+                &rate_label,
+                if p.is_offered { "yes" } else { "no" },
+                if p.is_eligible { "yes" } else { "no" },
+            ])
         );
     }
     println!("\n{} offer(s) total.", miner.products.len());
+    for line in extra_rate_lines(&miner.products, &retail_by_key) {
+        println!("{line}");
+    }
     for line in ineligible_detail_lines(&miner.products) {
         println!("{line}");
     }
     println!("\nRanked against the field? `gmcli pricing`");
     Ok(())
+}
+
+/// The per-dimension rate received, for each offer priced beyond the two
+/// anchors the table carries.
+///
+/// The table's `(+N more)` marker says the offer has more to it; this is where
+/// those N dimensions and their absolute figures live. An offer whose product
+/// prices only input and output contributes nothing.
+fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for offer in offers {
+        let (Some(bp), Ok(provider)) = (offer.discount_bp, offer.provider.parse::<Provider>())
+        else {
+            continue;
+        };
+        let Some(dims) = retail_by_key.get(&(provider, offer.model.as_str())) else {
+            continue;
+        };
+        let extras = extra_dimension_lines(dims, bp);
+        if extras.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!("  {}/{}", offer.provider, offer.model));
+        lines.extend(extras);
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    let mut out = vec![
+        String::new(),
+        "Priced beyond input/output — retail → you receive, per Mtok:".to_owned(),
+    ];
+    out.extend(lines);
+    out
 }
 
 /// Explain every ineligible offer beneath the table, one block each.
@@ -707,7 +841,7 @@ mod tests {
             &Provider::Anthropic,
             "claude-sonnet-4-6",
             500,
-            None,
+            DeclareArgs::default(),
         )
         .await
         .expect("a catalog product declares");
@@ -753,7 +887,7 @@ mod tests {
             &Provider::DeepInfra,
             "zai-org/GLM-5.2",
             500,
-            None,
+            DeclareArgs::default(),
         )
         .await
         .expect("a sourcing route declares even though GET /products omits it");
@@ -775,9 +909,15 @@ mod tests {
             .await;
 
         let mut client = RegistryClient::new(config_for(&server));
-        let err = cmd_declare_product(&mut client, &Provider::OpenAI, "gpt-typo", 500, None)
-            .await
-            .expect_err("a typo'd model must not be declared");
+        let err = cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-typo",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect_err("a typo'd model must not be declared");
 
         assert!(
             err.to_string().contains("unknown product openai/gpt-typo"),
@@ -812,9 +952,15 @@ mod tests {
             .await;
 
         let mut client = RegistryClient::new(config_for(&server));
-        let err = cmd_declare_product(&mut client, &Provider::OpenAI, "gpt-typo", 500, None)
-            .await
-            .expect_err("a typo'd model must not be declared");
+        let err = cmd_declare_product(
+            &mut client,
+            &Provider::OpenAI,
+            "gpt-typo",
+            500,
+            DeclareArgs::default(),
+        )
+        .await
+        .expect_err("a typo'd model must not be declared");
 
         assert!(
             err.to_string().contains("unknown product openai/gpt-typo"),
@@ -827,11 +973,177 @@ mod tests {
         assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
     }
 
+    #[tokio::test]
+    async fn a_scripted_declaration_is_not_blocked_by_the_price_confirmation() {
+        // The confirmation must never turn a piped or CI invocation into a
+        // hang or a silent no-op: `confirm` takes its default on a non-TTY
+        // stdin, which is what the test harness has. The declaration below
+        // passes no `--yes` at all and must still reach the registry.
+        let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+                "retail_price": retail(3_000_000_000, 15_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+
+        let mut client = RegistryClient::new(config_for(&server));
+        cmd_declare_products(&mut client, Some(&Provider::Anthropic), 500, false)
+            .await
+            .expect("a non-interactive fan-out declares without a --yes");
+
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+    }
+
+    #[test]
+    fn the_status_rule_is_exactly_as_wide_as_a_row() {
+        let row = status_row(&[
+            "PROVIDER",
+            "MODEL",
+            "DISCOUNT",
+            "YOU RECEIVE / MTOK",
+            "OFFERED",
+            "ELIGIBLE",
+        ]);
+        assert_eq!(status_rule().chars().count(), row.chars().count());
+        // The `(+N more)` marker has to fit beside the anchors, or the column
+        // it lives in silently pushes every column after it out of line.
+        assert!(
+            STATUS_COLUMNS[3] >= "$22.500 in / $112.500 out per Mtok (+8 more)".len(),
+            "the rate column truncates the richest row"
+        );
+    }
+
+    #[test]
+    fn the_status_detail_block_covers_only_offers_priced_beyond_the_anchors() {
+        let dims_rich = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            cache_read_per_mtok_ndollars: Some(300_000_000),
+            ..Default::default()
+        };
+        let dims_plain = RetailDimensions {
+            input_per_mtok_ndollars: 1_400_000_000,
+            output_per_mtok_ndollars: 4_400_000_000,
+            ..Default::default()
+        };
+        let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
+        retail_by_key.insert((Provider::Anthropic, "claude-sonnet-4-6"), &dims_rich);
+        retail_by_key.insert((Provider::Zai, "glm-5.2"), &dims_plain);
+
+        let rendered = extra_rate_lines(
+            &offers(serde_json::json!([
+                {
+                    "provider": "anthropic", "model": "claude-sonnet-4-6",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                },
+                {
+                    "provider": "zai", "model": "glm-5.2",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                },
+                // A provider this build predates: unparseable, and skipped
+                // rather than crashing the block.
+                {
+                    "provider": "brandnew", "model": "wonder-model-1",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                },
+            ])),
+            &retail_by_key,
+        )
+        .join("\n");
+
+        assert!(rendered.contains("Priced beyond input/output"));
+        assert!(rendered.contains("anthropic/claude-sonnet-4-6"));
+        assert!(
+            rendered.contains("cache read  $0.300 → $0.268"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("glm-5.2"), "{rendered}");
+        assert!(!rendered.contains("wonder-model-1"), "{rendered}");
+    }
+
+    #[test]
+    fn an_all_anchors_status_prints_no_detail_block() {
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 1_400_000_000,
+            output_per_mtok_ndollars: 4_400_000_000,
+            ..Default::default()
+        };
+        let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
+        retail_by_key.insert((Provider::Zai, "glm-5.2"), &dims);
+
+        assert!(extra_rate_lines(
+            &offers(serde_json::json!([{
+                "provider": "zai", "model": "glm-5.2",
+                "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+            }])),
+            &retail_by_key,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_fan_out_preview_expands_only_the_products_that_price_more() {
+        let catalog: ProductCatalogResponse = serde_json::from_value(serde_json::json!({
+            "products": [
+                {
+                    "provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+                    "retail_price": {
+                        "dimensions": {
+                            "input_per_mtok_ndollars": 3_000_000_000_u64,
+                            "output_per_mtok_ndollars": 15_000_000_000_u64,
+                            "cache_read_per_mtok_ndollars": 300_000_000_u64,
+                        },
+                    },
+                },
+                {
+                    "provider": "zai", "model": "glm-5.2", "status": "active",
+                    "retail_price": retail(1_400_000_000, 4_400_000_000),
+                },
+            ],
+        }))
+        .expect("decode catalog");
+
+        let rendered =
+            fan_out_preview_lines(&filter_catalog(&catalog.products, None), 1050).join("\n");
+
+        assert!(rendered.contains("Declaring 10.5% off retail on 2 product(s)"));
+        assert!(
+            rendered.contains("anthropic/claude-sonnet-4-6: $2.685 in / $13.425 out per Mtok"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cache read  $0.300 → $0.268"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("zai/glm-5.2: $1.253 in / $3.938 out per Mtok"),
+            "{rendered}"
+        );
+        // The two-dimension product contributes exactly one line: no "not
+        // priced" filler for the eight dimensions it does not carry.
+        assert_eq!(rendered.matches("zai/glm-5.2").count(), 1, "{rendered}");
+    }
+
     #[test]
     fn a_catalog_declaration_keeps_its_layout() {
+        // A product that prices only the two anchors must not gain an
+        // "Also priced" block listing eight dimensions it does not have.
         let dims = RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
             output_per_mtok_ndollars: 15_000_000_000,
+            ..Default::default()
         };
         assert_eq!(
             declaration_lines("anthropic/claude-sonnet-4-6", "Retail", &dims, 1050),
@@ -840,7 +1152,36 @@ mod tests {
                 "  Retail       : $3.000 input / $15.000 output per Mtok",
                 "  Declared     : 10.5% off",
                 "  You receive  : $2.685 input / $13.425 output per Mtok (89.5% of retail)",
-                "  → ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_declaration_shows_every_dimension_the_product_prices() {
+        // The absolute figures the miner confirms. Every one is
+        // floor(retail x 8950 / 10_000), and the threshold — a token count,
+        // not money — is quoted rather than discounted.
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            cache_read_per_mtok_ndollars: Some(300_000_000),
+            cache_write_5m_per_mtok_ndollars: Some(3_750_000_000),
+            long_context_threshold_tokens: Some(200_000),
+            long_context_input_per_mtok_ndollars: Some(6_000_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            declaration_lines("anthropic/claude-sonnet-4-6", "Retail", &dims, 1050),
+            vec![
+                "anthropic/claude-sonnet-4-6",
+                "  Retail       : $3.000 input / $15.000 output per Mtok",
+                "  Declared     : 10.5% off",
+                "  You receive  : $2.685 input / $13.425 output per Mtok (89.5% of retail)",
+                "  Also priced  : Retail → you receive, per Mtok",
+                "      cache read      $0.300 → $0.268",
+                "      cache write 5m  $3.750 → $3.356",
+                "      long-ctx input  $6.000 → $5.370",
+                "      long-ctx rates apply above 200000 input tokens",
             ]
         );
     }
@@ -869,7 +1210,6 @@ mod tests {
                 "  Retail (buyer)  : $1.400 input / $4.400 output per Mtok",
                 "  Declared        : 5% off",
                 "  You receive     : $1.330 input / $4.180 output per Mtok (95% of retail)",
-                "  → ok",
             ]
         );
     }

@@ -1,6 +1,13 @@
 //! Discount/price conversion, plus the `gmcli pricing` competitiveness view.
 //! All arithmetic is integer-only — money is nano-dollars (1 nUSD = 10⁻⁹ USD),
 //! never a float.
+//!
+//! Prices are a *vector*, not a pair: a product prices input and output plus
+//! up to eight further dimensions (prompt cache, audio, long context). A
+//! percent discount is the ergonomic way to express an offer, but it is
+//! resolved here into the absolute per-dimension figures the miner confirms —
+//! see [`effective_dimensions`]. [`PRICE_DIMENSIONS`] is the one list of
+//! dimensions the arithmetic and the rendering both walk.
 
 use std::fmt::Write as _;
 
@@ -16,8 +23,10 @@ pub const MAX_DISCOUNT_BP: u32 = 9_990;
 
 /// clap `value_parser` for `--discount-pct`.
 ///
-/// Parses a percent string with up to two decimal places into the registry's
-/// integer basis-point wire value without floating-point arithmetic.
+/// Parses a percent string with up to two decimal places into an integer
+/// basis-point value without floating-point arithmetic. The percentage is the
+/// input ergonomics only — [`effective_dimensions`] resolves it against the
+/// product's retail vector, and the miner confirms the absolute figures.
 ///
 /// # Errors
 ///
@@ -104,6 +113,115 @@ pub fn effective_per_mtok_ndollars(retail_ndollars: u64, discount_bp: u32) -> u6
     u64::try_from(effective).unwrap_or(retail_ndollars)
 }
 
+/// One priced dimension of a [`RetailDimensions`] vector: the label the CLI
+/// prints, whether it is one of the two anchors, and the accessors that read
+/// and write it.
+///
+/// [`PRICE_DIMENSIONS`] is the single list of dimensions the CLI knows about,
+/// so the vector arithmetic and every rendering of it cannot drift apart.
+struct PriceDimension {
+    label: &'static str,
+    /// True for input and output — the two dimensions every product prices and
+    /// the pair the summary line carries. The rest render only when priced.
+    anchor: bool,
+    get: fn(&RetailDimensions) -> Option<u64>,
+    set: fn(&mut RetailDimensions, u64),
+}
+
+/// Every *price* dimension, in the order the CLI prints them.
+///
+/// `long_context_threshold_tokens` is deliberately absent: it is a token
+/// count, not a price, so discounting it would be nonsense — it rides through
+/// [`effective_dimensions`] untouched.
+const PRICE_DIMENSIONS: [PriceDimension; 10] = [
+    PriceDimension {
+        label: "input",
+        anchor: true,
+        get: |d| Some(d.input_per_mtok_ndollars),
+        set: |d, v| d.input_per_mtok_ndollars = v,
+    },
+    PriceDimension {
+        label: "output",
+        anchor: true,
+        get: |d| Some(d.output_per_mtok_ndollars),
+        set: |d, v| d.output_per_mtok_ndollars = v,
+    },
+    PriceDimension {
+        label: "cache read",
+        anchor: false,
+        get: |d| d.cache_read_per_mtok_ndollars,
+        set: |d, v| d.cache_read_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "cache write 5m",
+        anchor: false,
+        get: |d| d.cache_write_5m_per_mtok_ndollars,
+        set: |d, v| d.cache_write_5m_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "cache write 1h",
+        anchor: false,
+        get: |d| d.cache_write_1h_per_mtok_ndollars,
+        set: |d, v| d.cache_write_1h_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "audio input",
+        anchor: false,
+        get: |d| d.audio_input_per_mtok_ndollars,
+        set: |d, v| d.audio_input_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "audio output",
+        anchor: false,
+        get: |d| d.audio_output_per_mtok_ndollars,
+        set: |d, v| d.audio_output_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "cache storage/hr",
+        anchor: false,
+        get: |d| d.cache_storage_per_mtok_hour_ndollars,
+        set: |d, v| d.cache_storage_per_mtok_hour_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "long-ctx input",
+        anchor: false,
+        get: |d| d.long_context_input_per_mtok_ndollars,
+        set: |d, v| d.long_context_input_per_mtok_ndollars = Some(v),
+    },
+    PriceDimension {
+        label: "long-ctx output",
+        anchor: false,
+        get: |d| d.long_context_output_per_mtok_ndollars,
+        set: |d, v| d.long_context_output_per_mtok_ndollars = Some(v),
+    },
+];
+
+/// Resolve a percentage discount into the absolute per-dimension vector the
+/// miner is actually paid on.
+///
+/// Every priced dimension gets the same
+/// [`effective_per_mtok_ndollars`] floor; a dimension the product does not
+/// price stays unpriced rather than becoming a zero, and
+/// `long_context_threshold_tokens` is copied verbatim because it is a token
+/// count and not money.
+///
+/// This is what `declare-product` shows the miner before it sends. A stored
+/// percentage would leave the miner's price moving whenever retail moved; the
+/// absolute vector is the thing they are agreeing to.
+#[must_use]
+pub fn effective_dimensions(retail: &RetailDimensions, discount_bp: u32) -> RetailDimensions {
+    let mut effective = retail.clone();
+    for dim in &PRICE_DIMENSIONS {
+        if let Some(value) = (dim.get)(retail) {
+            (dim.set)(
+                &mut effective,
+                effective_per_mtok_ndollars(value, discount_bp),
+            );
+        }
+    }
+    effective
+}
+
 /// Render an ndollar amount as dollars with 3 decimal places (e.g.
 /// `2_685_000_000 → "$2.685"`). One nano-dollar is `10^-9` USD; a tenth of a
 /// cent is the resolution the operator actually cares about.
@@ -114,24 +232,125 @@ pub fn format_usd(ndollars: u64) -> String {
     format!("${dollars}.{millis:03}")
 }
 
+/// Render one per-Mtok unit price, widening the fraction rather than rounding
+/// a real price away to `$0.000`.
+///
+/// [`format_usd`]'s three places suit a whole-request cost, but a unit price
+/// need not reach a tenth of a cent: a cache-read dimension on a cheap model
+/// is fractions of a cent per Mtok, and printing it as `$0.000` would tell the
+/// miner a priced dimension pays nothing. Integer arithmetic throughout — the
+/// fraction is produced by division and remainder, never a float.
 #[must_use]
 pub fn format_per_mtok_usd(ndollars: u64) -> String {
-    format_usd(ndollars)
+    // ≥ $0.001, and exact zero, read correctly at three places.
+    if ndollars == 0 || ndollars >= 1_000_000 {
+        return format_usd(ndollars);
+    }
+    let dollars = ndollars / 1_000_000_000;
+    if ndollars >= 1_000 {
+        // ≥ $0.000001: six places resolve it.
+        let micros = (ndollars % 1_000_000_000) / 1_000;
+        return format!("${dollars}.{micros:06}");
+    }
+    // Below a millionth of a dollar per Mtok: nano-dollars are the floor of
+    // the unit itself, so nine places is exact and cannot lose a digit.
+    let nanos = ndollars % 1_000_000_000;
+    format!("${dollars}.{nanos:09}")
 }
 
 /// One-line summary of the per-Mtok rate the miner will receive on a
 /// product, given retail dimensions and a discount. Shared between
 /// the single-product declaration output and the fan-out summary so
 /// every site renders the same shape.
+///
+/// The two anchors only: they are what routing is decided on, and they are the
+/// pair every product prices. When the product prices more, the count of the
+/// rest is appended so the miner knows to look for
+/// [`extra_dimension_lines`] rather than reading the line as the whole deal.
 #[must_use]
 pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> String {
-    let eff_in = effective_per_mtok_ndollars(retail.input_per_mtok_ndollars, discount_bp);
-    let eff_out = effective_per_mtok_ndollars(retail.output_per_mtok_ndollars, discount_bp);
-    format!(
+    let effective = effective_dimensions(retail, discount_bp);
+    let summary = format!(
         "{} in / {} out per Mtok",
-        format_per_mtok_usd(eff_in),
-        format_per_mtok_usd(eff_out)
-    )
+        format_per_mtok_usd(effective.input_per_mtok_ndollars),
+        format_per_mtok_usd(effective.output_per_mtok_ndollars)
+    );
+    match extra_dimension_count(retail) {
+        0 => summary,
+        n => format!("{summary} (+{n} more)"),
+    }
+}
+
+/// How many dimensions beyond input and output this product prices.
+#[must_use]
+pub fn extra_dimension_count(retail: &RetailDimensions) -> usize {
+    PRICE_DIMENSIONS
+        .iter()
+        .filter(|dim| !dim.anchor && (dim.get)(retail).is_some())
+        .count()
+}
+
+/// Indented `retail → you receive` rows for every dimension priced beyond the
+/// two anchors, in table order.
+///
+/// Empty for a product that prices only input and output — the common case,
+/// and the reason a caller can print this unconditionally without burying a
+/// two-dimension product under eight lines of "not priced".
+#[must_use]
+pub fn extra_dimension_lines(retail: &RetailDimensions, discount_bp: u32) -> Vec<String> {
+    let effective = effective_dimensions(retail, discount_bp);
+    let rows: Vec<_> = PRICE_DIMENSIONS
+        .iter()
+        .filter(|dim| !dim.anchor)
+        .filter_map(|dim| {
+            let priced = (dim.get)(retail)?;
+            let received = (dim.get)(&effective)?;
+            Some((dim.label, priced, received))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let label_width = rows
+        .iter()
+        .map(|(label, ..)| label.len())
+        .max()
+        .unwrap_or(0);
+    let price_width = rows
+        .iter()
+        .map(|&(_, priced, _)| format_per_mtok_usd(priced).len())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<String> = rows
+        .iter()
+        .map(|&(label, priced, received)| {
+            format!(
+                "      {label:<label_width$}  {:>price_width$} → {}",
+                format_per_mtok_usd(priced),
+                format_per_mtok_usd(received),
+            )
+        })
+        .collect();
+    if let Some(threshold) = long_context_note(retail) {
+        lines.push(threshold);
+    }
+    lines
+}
+
+/// The token count the long-context rows are the price *above*, when the
+/// product prices a long-context tier at all. Without it those two rows are
+/// two unexplained numbers.
+fn long_context_note(retail: &RetailDimensions) -> Option<String> {
+    let threshold = retail.long_context_threshold_tokens?;
+    let prices_long_context = retail.long_context_input_per_mtok_ndollars.is_some()
+        || retail.long_context_output_per_mtok_ndollars.is_some();
+    if !prices_long_context {
+        return None;
+    }
+    Some(format!(
+        "      long-ctx rates apply above {threshold} input tokens"
+    ))
 }
 
 /// The `gmcli pricing` view: how each of the miner's offers ranks against the
@@ -308,11 +527,58 @@ fn advice_lines(yours: &[&ProductCompetitiveness]) -> Vec<String> {
 )]
 mod tests {
     use super::{
-        effective_per_mtok_ndollars, effective_rate_summary, format_discount_pct, format_usd,
-        parse_discount_pct, rank_row, rank_rule, render_pricing, Network, ProductCompetitiveness,
-        MAX_DISCOUNT_BP, RANK_COLUMNS,
+        effective_dimensions, effective_per_mtok_ndollars, effective_rate_summary,
+        extra_dimension_count, extra_dimension_lines, format_discount_pct, format_per_mtok_usd,
+        format_usd, parse_discount_pct, rank_row, rank_rule, render_pricing, Network,
+        ProductCompetitiveness, MAX_DISCOUNT_BP, PRICE_DIMENSIONS, RANK_COLUMNS,
     };
     use crate::types::RetailDimensions;
+
+    /// A vector that prices every dimension, so a test can assert on all ten at
+    /// once. The audio prices are deliberately not multiples of 10 000 — the
+    /// floor has to bite somewhere.
+    fn full_vector() -> RetailDimensions {
+        RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            cache_read_per_mtok_ndollars: Some(300_000_000),
+            cache_write_5m_per_mtok_ndollars: Some(3_750_000_000),
+            cache_write_1h_per_mtok_ndollars: Some(6_000_000_000),
+            audio_input_per_mtok_ndollars: Some(100_000_001),
+            audio_output_per_mtok_ndollars: Some(200_000_003),
+            cache_storage_per_mtok_hour_ndollars: Some(50_000_000),
+            long_context_threshold_tokens: Some(200_000),
+            long_context_input_per_mtok_ndollars: Some(6_000_000_000),
+            long_context_output_per_mtok_ndollars: Some(22_500_000_000),
+        }
+    }
+
+    /// Every dimension of `dims` as `(name, value)`, written out by hand.
+    ///
+    /// The point is that it does *not* go through `PRICE_DIMENSIONS`: a
+    /// dimension added to [`RetailDimensions`] but never wired into that table
+    /// would keep its retail value through a discount, and a check built on
+    /// the same table could not see it.
+    fn all_prices(dims: &RetailDimensions) -> Vec<(&'static str, Option<u64>)> {
+        vec![
+            ("input", Some(dims.input_per_mtok_ndollars)),
+            ("output", Some(dims.output_per_mtok_ndollars)),
+            ("cache_read", dims.cache_read_per_mtok_ndollars),
+            ("cache_write_5m", dims.cache_write_5m_per_mtok_ndollars),
+            ("cache_write_1h", dims.cache_write_1h_per_mtok_ndollars),
+            ("audio_input", dims.audio_input_per_mtok_ndollars),
+            ("audio_output", dims.audio_output_per_mtok_ndollars),
+            ("cache_storage", dims.cache_storage_per_mtok_hour_ndollars),
+            (
+                "long_context_input",
+                dims.long_context_input_per_mtok_ndollars,
+            ),
+            (
+                "long_context_output",
+                dims.long_context_output_per_mtok_ndollars,
+            ),
+        ]
+    }
 
     fn products(value: serde_json::Value) -> Vec<ProductCompetitiveness> {
         serde_json::from_value(value).expect("decode competitiveness")
@@ -407,6 +673,7 @@ mod tests {
         let dims = RetailDimensions {
             input_per_mtok_ndollars: 3_000_000_000,
             output_per_mtok_ndollars: 15_000_000_000,
+            ..Default::default()
         };
         assert_eq!(
             effective_rate_summary(&dims, 1050),
@@ -520,5 +787,218 @@ mod tests {
         // declare again sends the miner at the wrong problem.
         assert!(!rendered.contains("Offered by others, not by you"));
         assert!(!rendered.contains("declare-product"));
+    }
+
+    // ── the price vector ─────────────────────────────────────────────────
+
+    #[test]
+    fn every_price_dimension_is_wired_into_the_table() {
+        // A dimension missing from PRICE_DIMENSIONS rides through a discount
+        // unchanged. Every price in `full_vector` is distinct and non-zero, so
+        // an unchanged value names the field that was forgotten.
+        let retail = full_vector();
+        let effective = effective_dimensions(&retail, 1050);
+        let missed: Vec<_> = all_prices(&retail)
+            .into_iter()
+            .zip(all_prices(&effective))
+            .filter(|((_, before), (_, after))| before == after)
+            .map(|((name, _), _)| name)
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "not discounted — missing from PRICE_DIMENSIONS: {missed:?}"
+        );
+        assert_eq!(PRICE_DIMENSIONS.len(), all_prices(&retail).len());
+    }
+
+    #[test]
+    fn every_dimension_takes_the_same_floor_as_the_gateway() {
+        let effective = effective_dimensions(&full_vector(), 1050);
+        assert_eq!(effective.input_per_mtok_ndollars, 2_685_000_000);
+        assert_eq!(effective.output_per_mtok_ndollars, 13_425_000_000);
+        assert_eq!(effective.cache_read_per_mtok_ndollars, Some(268_500_000));
+        assert_eq!(
+            effective.cache_write_5m_per_mtok_ndollars,
+            Some(3_356_250_000)
+        );
+        assert_eq!(
+            effective.cache_write_1h_per_mtok_ndollars,
+            Some(5_370_000_000)
+        );
+        assert_eq!(
+            effective.cache_storage_per_mtok_hour_ndollars,
+            Some(44_750_000)
+        );
+        assert_eq!(
+            effective.long_context_output_per_mtok_ndollars,
+            Some(20_137_500_000)
+        );
+    }
+
+    #[test]
+    fn floor_division_truncates_rather_than_rounding() {
+        // 100_000_001 × 8950 / 10_000 = 89_500_000.895 → 89_500_000.
+        let effective = effective_dimensions(&full_vector(), 1050);
+        assert_eq!(effective.audio_input_per_mtok_ndollars, Some(89_500_000));
+        // 200_000_003 × 8950 / 10_000 = 179_000_002.685 → 179_000_002.
+        assert_eq!(effective.audio_output_per_mtok_ndollars, Some(179_000_002));
+
+        // A price the floor eats entirely: 3 ndollars at the cap is 0.003 → 0.
+        // The miner is shown the zero they will actually be paid.
+        let dust = RetailDimensions {
+            input_per_mtok_ndollars: 3,
+            output_per_mtok_ndollars: 10_000,
+            ..Default::default()
+        };
+        let effective = effective_dimensions(&dust, MAX_DISCOUNT_BP);
+        assert_eq!(effective.input_per_mtok_ndollars, 0);
+        assert_eq!(effective.output_per_mtok_ndollars, 10);
+    }
+
+    #[test]
+    fn a_null_dimension_stays_null_rather_than_becoming_zero() {
+        // A model with no prompt cache prices no cache dimension. Resolving it
+        // to $0.000 would read as "cache reads are free" — a different offer
+        // from "this model has no cache".
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            cache_read_per_mtok_ndollars: Some(300_000_000),
+            ..Default::default()
+        };
+        let effective = effective_dimensions(&dims, 1050);
+        assert_eq!(effective.cache_read_per_mtok_ndollars, Some(268_500_000));
+        assert_eq!(effective.cache_write_5m_per_mtok_ndollars, None);
+        assert_eq!(effective.audio_input_per_mtok_ndollars, None);
+        assert_eq!(effective.long_context_output_per_mtok_ndollars, None);
+        assert_eq!(extra_dimension_count(&dims), 1);
+    }
+
+    #[test]
+    fn a_zero_discount_returns_the_retail_vector_verbatim() {
+        let retail = full_vector();
+        assert_eq!(
+            all_prices(&effective_dimensions(&retail, 0)),
+            all_prices(&retail)
+        );
+    }
+
+    #[test]
+    fn the_cap_leaves_a_tenth_of_a_percent_on_every_dimension() {
+        let effective = effective_dimensions(&full_vector(), MAX_DISCOUNT_BP);
+        assert_eq!(effective.input_per_mtok_ndollars, 3_000_000);
+        assert_eq!(effective.output_per_mtok_ndollars, 15_000_000);
+        assert_eq!(effective.cache_read_per_mtok_ndollars, Some(300_000));
+        assert_eq!(
+            effective.long_context_output_per_mtok_ndollars,
+            Some(22_500_000)
+        );
+    }
+
+    #[test]
+    fn the_long_context_threshold_is_a_token_count_and_is_never_discounted() {
+        // Discounting it would move where the long-context tier starts, which
+        // is not a price anyone is declaring.
+        for bp in [0, 1050, MAX_DISCOUNT_BP] {
+            assert_eq!(
+                effective_dimensions(&full_vector(), bp).long_context_threshold_tokens,
+                Some(200_000),
+                "threshold moved at {bp} bp"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_vector_decodes_from_what_the_registry_actually_sends() {
+        // The registry omits dimensions a model does not price rather than
+        // always sending explicit nulls, and may add one this build predates.
+        let dims: RetailDimensions = serde_json::from_value(serde_json::json!({
+            "input_per_mtok_ndollars": 1_400_000_000_u64,
+            "output_per_mtok_ndollars": 4_400_000_000_u64,
+            "cache_read_per_mtok_ndollars": null,
+            "some_dimension_from_the_future_ndollars": 7,
+        }))
+        .expect("a partial vector carrying an unknown field still decodes");
+
+        assert_eq!(dims.input_per_mtok_ndollars, 1_400_000_000);
+        assert_eq!(dims.cache_read_per_mtok_ndollars, None);
+        assert_eq!(dims.cache_write_1h_per_mtok_ndollars, None);
+        assert_eq!(extra_dimension_count(&dims), 0);
+    }
+
+    #[test]
+    fn a_unit_price_below_a_tenth_of_a_cent_keeps_its_digits() {
+        // Three decimal places would render every one of these as "$0.000",
+        // telling the miner a priced dimension pays nothing.
+        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
+        assert_eq!(format_per_mtok_usd(1_000_000), "$0.001");
+        assert_eq!(format_per_mtok_usd(999_999), "$0.000999");
+        assert_eq!(format_per_mtok_usd(100_000), "$0.000100");
+        assert_eq!(format_per_mtok_usd(1_000), "$0.000001");
+        assert_eq!(format_per_mtok_usd(999), "$0.000000999");
+        assert_eq!(format_per_mtok_usd(1), "$0.000000001");
+        // Zero is a real answer, not a rounding artefact, so it stays short.
+        assert_eq!(format_per_mtok_usd(0), "$0.000");
+        // The whole-request cost formatter keeps its three places.
+        assert_eq!(format_usd(999_999), "$0.000");
+    }
+
+    #[test]
+    fn the_summary_line_names_the_dimensions_it_is_not_showing() {
+        // The status table cell has room for the two anchors routing is
+        // decided on. Without the count a miner reads that line as the whole
+        // offer and never looks for the rest.
+        assert_eq!(
+            effective_rate_summary(&full_vector(), 1050),
+            "$2.685 in / $13.425 out per Mtok (+8 more)"
+        );
+        let anchors_only = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_rate_summary(&anchors_only, 1050),
+            "$2.685 in / $13.425 out per Mtok"
+        );
+        assert!(extra_dimension_lines(&anchors_only, 1050).is_empty());
+    }
+
+    #[test]
+    fn the_extra_rows_show_retail_beside_what_is_received() {
+        let rendered = extra_dimension_lines(&full_vector(), 1050).join("\n");
+        // Labels pad to the widest present, prices right-align so the decimal
+        // points line up — $22.500 next to $0.300 is otherwise unreadable.
+        assert!(
+            rendered.contains("cache read         $0.300 → $0.268"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cache storage/hr   $0.050 → $0.044"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("long-ctx output   $22.500 → $20.137"),
+            "{rendered}"
+        );
+        // The anchors are on the summary line; repeating them here would
+        // double-count the two dimensions that matter most.
+        assert!(!rendered.contains("$3.000 → $2.685"), "{rendered}");
+        assert!(rendered.contains("long-ctx rates apply above 200000 input tokens"));
+    }
+
+    #[test]
+    fn a_threshold_without_long_context_prices_explains_nothing_and_is_dropped() {
+        // A threshold with no tier priced against it is a dangling number.
+        let dims = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            cache_read_per_mtok_ndollars: Some(300_000_000),
+            long_context_threshold_tokens: Some(200_000),
+            ..Default::default()
+        };
+        let rendered = extra_dimension_lines(&dims, 1050).join("\n");
+        assert!(rendered.contains("cache read"));
+        assert!(!rendered.contains("long-ctx"), "{rendered}");
     }
 }

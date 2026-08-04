@@ -43,21 +43,27 @@ and you declare them normally — but they are the same idea:
 Settlement is always on the **buyer** product's retail, never the source's:
 
 ```
-your rate per Mtok = buyer_retail x (10000 - discount_bp) / 10000
+your rate per Mtok = buyer_retail[dimension] x (10000 - discount_bp) / 10000
 ```
 
-So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out, declaring the
-DeepInfra route at `--discount-pct 5` pays you:
+The discount applies to every dimension the buyer product prices — input and
+output always, plus prompt-cache, audio and long-context rates where the model
+has them. So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out,
+declaring the DeepInfra route at `--discount-pct 5` pays you:
 
 ```
 in:  $1.40 x 9500 / 10000 = $1.330 per Mtok
 out: $4.40 x 9500 / 10000 = $4.180 per Mtok
 ```
 
+`gmcli declare-product` prints the resolved figure for every priced dimension
+and asks you to confirm before it sends anything.
+
 Your spread is that figure minus whatever DeepInfra charges you for the same
 tokens. `gmcli sources` shows the buyer retail in the `BUYER RETAIL / MTOK`
 column so you can compute the left-hand side; the right-hand side is between you
-and the upstream.
+and the upstream. A trailing `+N` in that column counts the dimensions the buyer
+product prices beyond input and output.
 
 > **The source product's own catalog price is not your cost.** The registry
 > carries a price row for `deepinfra/zai-org/GLM-5.2`, but it is set to mirror the

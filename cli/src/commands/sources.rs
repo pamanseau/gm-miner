@@ -9,8 +9,8 @@ use anyhow::{Context as _, Result};
 use gm_miner_cli::{
     client::RegistryClient,
     network::Network,
-    pricing::format_per_mtok_usd,
-    types::{SourceProduct, SourceProductsResponse},
+    pricing::{extra_dimension_count, format_per_mtok_usd},
+    types::{RetailDimensions, SourceProduct, SourceProductsResponse},
 };
 
 use crate::commands::status_error;
@@ -79,7 +79,7 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
 const SOURCE_COLUMNS: [(&str, usize); 5] = [
     ("ROUTE", 38),
     ("SERVES", 22),
-    ("BUYER RETAIL / MTOK", 26),
+    ("BUYER RETAIL / MTOK", 30),
     ("YOU SERVE", 16),
     ("OFFERED", 7),
 ];
@@ -158,14 +158,28 @@ fn route_line(source: &SourceProduct) -> String {
     source_row(&[
         format!("{}/{}", source.provider, source.model),
         format!("{}/{}", source.buyer_provider, source.buyer_model),
-        format!(
-            "{} in / {} out",
-            format_per_mtok_usd(retail.input_per_mtok_ndollars),
-            format_per_mtok_usd(retail.output_per_mtok_ndollars),
-        ),
+        buyer_retail_cell(retail),
         serving_cell(source.capable_worker_count),
         if source.already_offered { "yes" } else { "no" }.to_owned(),
     ])
+}
+
+/// The buyer product's retail anchors, plus a count of the dimensions it
+/// prices beyond them.
+///
+/// Settlement is on the buyer product's whole price vector, not just input and
+/// output, so a route whose buyer product prices a prompt cache has to say so —
+/// `gmcli declare-product` then prints every dimension in full.
+fn buyer_retail_cell(retail: &RetailDimensions) -> String {
+    let anchors = format!(
+        "{} in / {} out",
+        format_per_mtok_usd(retail.input_per_mtok_ndollars),
+        format_per_mtok_usd(retail.output_per_mtok_ndollars),
+    );
+    match extra_dimension_count(retail) {
+        0 => anchors,
+        n => format!("{anchors} +{n}"),
+    }
 }
 
 fn serving_cell(capable_worker_count: u32) -> String {
