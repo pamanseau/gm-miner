@@ -36,8 +36,9 @@ use crate::commands::{get_me_json, sources::fetch_sources, status_error};
 /// miner's routes are consulted before the declaration is rejected.
 ///
 /// The resolved per-dimension prices are printed and confirmed *before* the
-/// POST: `--discount-pct` is input ergonomics, and what the miner commits to
-/// is the absolute vector it resolves to.
+/// POST, so the miner sees the absolute figures a percentage works out to
+/// rather than agreeing to an expression. What is *sent* is still the
+/// percentage — see [`sent_as_lines`] for why the prompt says so.
 pub(crate) async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
@@ -66,7 +67,14 @@ pub(crate) async fn cmd_declare_product(
     for line in lines {
         println!("{line}");
     }
-    if !confirm("Declare at these prices?", true, args.assume_yes)? {
+    if !confirm(
+        &format!(
+            "Declare at {}% off retail?",
+            format_discount_pct(discount_bp)
+        ),
+        true,
+        args.assume_yes,
+    )? {
         println!("Not declared — nothing was sent.");
         return Ok(());
     }
@@ -75,6 +83,42 @@ pub(crate) async fn cmd_declare_product(
     println!("  → ok");
     println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
+}
+
+/// The line that keeps the confirmation honest about what crosses the wire.
+///
+/// The figures above are resolved against the retail this run just fetched,
+/// but the request body carries `discount_bp` alone (see
+/// [`ProductDeclarationRequest`]). The registry re-resolves the vector against
+/// whatever retail it holds when it records the offer, so a retail change
+/// between the catalog fetch and the POST leaves the miner paid on the
+/// registry's numbers rather than the printed ones. `declare-products` widens
+/// that window further — every target is priced and confirmed once, then sent
+/// one request at a time.
+///
+/// The prompt therefore asks about the percentage, which is what is actually
+/// sent, and offers the absolutes as "at current retail". Wording it as
+/// "declare at these prices?" would promise an atomicity the wire does not
+/// have.
+///
+/// This stops being a caveat once the send path carries the absolute vector.
+/// Closing the race completely needs more than that: the CLI would send a
+/// fingerprint of the retail it resolved against and the registry would reject
+/// a stale one. Neither is built here.
+///
+/// `width` is the label column [`declaration_lines`] computed, so this reads as
+/// one more row of the same block.
+fn sent_as_lines(discount_pct: &str, width: usize) -> [String; 2] {
+    [
+        format!(
+            "  {:<width$}: {discount_pct}% off, not the figures above.",
+            "Sent as"
+        ),
+        format!(
+            "  {:<width$}  The registry resolves them against its own retail.",
+            ""
+        ),
+    ]
 }
 
 /// The non-pricing arguments of a single declaration.
@@ -153,6 +197,9 @@ async fn resolve_source(
 ///
 /// The dimensions beyond input/output are listed only when the product prices
 /// them, so a two-dimension product renders in three lines exactly as before.
+///
+/// Ends with [`sent_as_lines`]: every figure here is resolved locally, and the
+/// block must not read as though those figures are what crosses the wire.
 fn declaration_lines(
     header: &str,
     retail_label: &str,
@@ -191,6 +238,7 @@ fn declaration_lines(
         ));
         lines.extend(extras);
     }
+    lines.extend(sent_as_lines(&format_discount_pct(discount_bp), width));
     lines
 }
 
@@ -232,7 +280,11 @@ pub(crate) async fn cmd_declare_products(
         println!("{line}");
     }
     if !confirm(
-        &format!("Declare {} offer(s) at these prices?", targets.len()),
+        &format!(
+            "Declare {} offer(s) at {}% off retail?",
+            targets.len(),
+            format_discount_pct(discount_bp)
+        ),
         true,
         assume_yes,
     )? {
@@ -271,12 +323,18 @@ pub(crate) async fn cmd_declare_products(
 /// The whole catalog at one discount is dozens of products; expanding all ten
 /// dimensions for each would bury the two that matter. Expanding only what a
 /// product actually prices keeps the common row to one line and still shows
-/// every absolute figure the miner is agreeing to.
+/// every absolute figure the discount works out to.
+///
+/// "At current retail" is doing real work in that header: the fan-out sends
+/// `discount_bp` per product, one POST at a time, so the window between these
+/// figures and what the registry records is wider here than anywhere else.
+/// See [`sent_as_lines`].
 fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> {
     let discount_pct = format_discount_pct(discount_bp);
     let mut lines = vec![
         format!(
-            "Declaring {discount_pct}% off retail on {} product(s). You would receive:",
+            "Declaring {discount_pct}% off retail on {} product(s). \
+             At current retail you would receive:",
             targets.len()
         ),
         String::new(),
@@ -293,6 +351,11 @@ fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> 
         ));
         lines.extend(extra_dimension_lines(dims, discount_bp));
     }
+    lines.push(String::new());
+    lines.push(format!(
+        "Sent as {discount_pct}% off per product — the registry resolves the figures"
+    ));
+    lines.push("above against its own retail when it records each offer.".to_owned());
     lines.push(String::new());
     lines
 }
@@ -540,23 +603,54 @@ pub(crate) async fn cmd_status(client: &mut RegistryClient) -> Result<()> {
     print_product_table(client, &miner).await
 }
 
-/// Column widths for the `status` product table, and the rule beneath it.
-const STATUS_COLUMNS: [usize; 6] = [12, 32, 10, 44, 8, 8];
+const STATUS_HEADERS: [&str; 6] = [
+    "PROVIDER",
+    "MODEL",
+    "DISCOUNT",
+    "YOU RECEIVE / MTOK",
+    "OFFERED",
+    "ELIGIBLE",
+];
 
-fn status_row(cells: &[&str; 6]) -> String {
-    let mut row = String::new();
-    for (i, (width, cell)) in STATUS_COLUMNS.iter().zip(cells).enumerate() {
-        if i > 0 {
-            row.push(' ');
+/// Header, rule and rows, with every column sized to its own widest cell.
+///
+/// Fixed widths were the bug: a rate cell is now
+/// `$0.000999999 in / $0.000000999 out per Mtok (+8 more)` for a cheap model
+/// with a full price vector, and any constant picked against a `$3.000`
+/// example overflows and shunts `OFFERED`/`ELIGIBLE` off their headers — for
+/// exactly the small-price products this rendering exists to clarify. Sizing
+/// from the data cannot be outgrown.
+fn status_table_lines(rows: &[[String; 6]]) -> Vec<String> {
+    let mut widths = STATUS_HEADERS.map(str::len);
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
         }
-        let _ = write!(row, "{cell:<width$}");
     }
-    row
-}
 
-fn status_rule() -> String {
-    let cells: usize = STATUS_COLUMNS.iter().sum();
-    "-".repeat(cells + STATUS_COLUMNS.len() - 1)
+    let render = |cells: &[&str]| -> String {
+        let mut row = String::new();
+        for (i, (width, cell)) in widths.iter().zip(cells).enumerate() {
+            if i > 0 {
+                row.push(' ');
+            }
+            let _ = write!(row, "{cell:<width$}");
+        }
+        // Every column is padded, including the last, so header, rule and
+        // every row are the same width — which is the property the test
+        // asserts against the rendered output.
+        row
+    };
+
+    let mut lines = vec![
+        render(&STATUS_HEADERS),
+        "-".repeat(widths.iter().sum::<usize>() + widths.len() - 1),
+    ];
+    lines.extend(rows.iter().map(|row| {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        render(&cells)
+    }));
+    lines
 }
 
 /// The catalog retail vector for each product, keyed by (provider, model).
@@ -580,42 +674,8 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
         .collect();
 
     println!("\nProducts:");
-    println!(
-        "{}",
-        status_row(&[
-            "PROVIDER",
-            "MODEL",
-            "DISCOUNT",
-            "YOU RECEIVE / MTOK",
-            "OFFERED",
-            "ELIGIBLE"
-        ])
-    );
-    println!("{}", status_rule());
-    for p in &miner.products {
-        let provider: Result<Provider, _> = p.provider.parse();
-        let (discount_label, rate_label) = match (p.discount_bp, provider) {
-            (Some(bp), Ok(prov)) => {
-                let label = format!("{}%", format_discount_pct(bp));
-                let rate = retail_by_key.get(&(prov, p.model.as_str())).map_or_else(
-                    || "(retail unknown)".to_owned(),
-                    |dims| effective_rate_summary(dims, bp),
-                );
-                (label, rate)
-            }
-            _ => ("—".to_owned(), "—".to_owned()),
-        };
-        println!(
-            "{}",
-            status_row(&[
-                &p.provider,
-                &p.model,
-                &discount_label,
-                &rate_label,
-                if p.is_offered { "yes" } else { "no" },
-                if p.is_eligible { "yes" } else { "no" },
-            ])
-        );
+    for line in status_table_lines(&status_rows(&miner.products, &retail_by_key)) {
+        println!("{line}");
     }
     println!("\n{} offer(s) total.", miner.products.len());
     for line in extra_rate_lines(&miner.products, &retail_by_key) {
@@ -626,6 +686,41 @@ async fn print_product_table(client: &mut RegistryClient, miner: &MinerStatus) -
     }
     println!("\nRanked against the field? `gmcli pricing`");
     Ok(())
+}
+
+/// One table row per offer: the discount, and the rate it works out to at the
+/// catalog's retail.
+///
+/// An offer whose product the catalog does not carry — a sourcing route, or a
+/// product withdrawn since — keeps its row with the rate marked unknown rather
+/// than being dropped from a table headed "your offers".
+fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<[String; 6]> {
+    offers
+        .iter()
+        .map(|offer| {
+            let (discount_label, rate_label) =
+                match (offer.discount_bp, offer.provider.parse::<Provider>()) {
+                    (Some(bp), Ok(provider)) => (
+                        format!("{}%", format_discount_pct(bp)),
+                        retail_by_key
+                            .get(&(provider, offer.model.as_str()))
+                            .map_or_else(
+                                || "(retail unknown)".to_owned(),
+                                |dims| effective_rate_summary(dims, bp),
+                            ),
+                    ),
+                    _ => ("—".to_owned(), "—".to_owned()),
+                };
+            [
+                offer.provider.clone(),
+                offer.model.clone(),
+                discount_label,
+                rate_label,
+                if offer.is_offered { "yes" } else { "no" }.to_owned(),
+                if offer.is_eligible { "yes" } else { "no" }.to_owned(),
+            ]
+        })
+        .collect()
 }
 
 /// The per-dimension rate received, for each offer priced beyond the two
@@ -1007,22 +1102,75 @@ mod tests {
     }
 
     #[test]
-    fn the_status_rule_is_exactly_as_wide_as_a_row() {
-        let row = status_row(&[
-            "PROVIDER",
-            "MODEL",
-            "DISCOUNT",
-            "YOU RECEIVE / MTOK",
-            "OFFERED",
-            "ELIGIBLE",
-        ]);
-        assert_eq!(status_rule().chars().count(), row.chars().count());
-        // The `(+N more)` marker has to fit beside the anchors, or the column
-        // it lives in silently pushes every column after it out of line.
-        assert!(
-            STATUS_COLUMNS[3] >= "$22.500 in / $112.500 out per Mtok (+8 more)".len(),
-            "the rate column truncates the richest row"
+    fn the_status_table_fits_its_widest_rendered_row() {
+        // A cheap model with a full price vector produces the widest rate cell
+        // this table can hold. Asserting a constant against a "$3.000" example
+        // is what let the old fixed 44 overflow: check the rendered rows.
+        let tiny = RetailDimensions {
+            input_per_mtok_ndollars: 999_999,
+            output_per_mtok_ndollars: 999,
+            cache_read_per_mtok_ndollars: Some(500),
+            cache_write_5m_per_mtok_ndollars: Some(500),
+            cache_write_1h_per_mtok_ndollars: Some(500),
+            audio_input_per_mtok_ndollars: Some(500),
+            audio_output_per_mtok_ndollars: Some(500),
+            cache_storage_per_mtok_hour_ndollars: Some(500),
+            long_context_threshold_tokens: Some(200_000),
+            long_context_input_per_mtok_ndollars: Some(500),
+            long_context_output_per_mtok_ndollars: Some(500),
+        };
+        let plain = RetailDimensions {
+            input_per_mtok_ndollars: 3_000_000_000,
+            output_per_mtok_ndollars: 15_000_000_000,
+            ..Default::default()
+        };
+        let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
+        retail_by_key.insert(
+            (Provider::Chutes, "a-very-cheap-model-with-a-long-id"),
+            &tiny,
         );
+        retail_by_key.insert((Provider::Anthropic, "claude-sonnet-4-6"), &plain);
+
+        let rows = status_rows(
+            &offers(serde_json::json!([
+                {
+                    "provider": "chutes", "model": "a-very-cheap-model-with-a-long-id",
+                    "is_offered": true, "is_eligible": true, "discount_bp": 1050,
+                },
+                {
+                    "provider": "anthropic", "model": "claude-sonnet-4-6",
+                    "is_offered": true, "is_eligible": false, "discount_bp": 500,
+                },
+            ])),
+            &retail_by_key,
+        );
+        let lines = status_table_lines(&rows);
+
+        let width = lines[0].chars().count();
+        for line in &lines {
+            assert_eq!(
+                line.chars().count(),
+                width,
+                "row is not the table's width:\n{}",
+                lines.join("\n")
+            );
+        }
+        // The widest cell must be present in full, not truncated, and the
+        // columns after it must still start where the header's do.
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("$0.000894999 in / $0.000000894 out per Mtok (+8 more)"),
+            "{rendered}"
+        );
+        let eligible_at = lines[0]
+            .find("ELIGIBLE")
+            .expect("the header names the last column");
+        for line in lines.iter().skip(2) {
+            assert!(
+                line[eligible_at..].starts_with("yes") || line[eligible_at..].starts_with("no"),
+                "the ELIGIBLE column is out of line:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1152,6 +1300,8 @@ mod tests {
                 "  Retail       : $3.000 input / $15.000 output per Mtok",
                 "  Declared     : 10.5% off",
                 "  You receive  : $2.685 input / $13.425 output per Mtok (89.5% of retail)",
+                "  Sent as      : 10.5% off, not the figures above.",
+                "                 The registry resolves them against its own retail.",
             ]
         );
     }
@@ -1178,10 +1328,14 @@ mod tests {
                 "  Declared     : 10.5% off",
                 "  You receive  : $2.685 input / $13.425 output per Mtok (89.5% of retail)",
                 "  Also priced  : Retail → you receive, per Mtok",
-                "      cache read      $0.300 → $0.268",
-                "      cache write 5m  $3.750 → $3.356",
+                // $0.2685 and $3.35625, not a truncated $0.268 / $3.356: the
+                // received figure is shown to the nano-dollar it is paid at.
+                "      cache read      $0.300 → $0.2685",
+                "      cache write 5m  $3.750 → $3.35625",
                 "      long-ctx input  $6.000 → $5.370",
                 "      long-ctx rates apply above 200000 input tokens",
+                "  Sent as      : 10.5% off, not the figures above.",
+                "                 The registry resolves them against its own retail.",
             ]
         );
     }
@@ -1210,6 +1364,8 @@ mod tests {
                 "  Retail (buyer)  : $1.400 input / $4.400 output per Mtok",
                 "  Declared        : 5% off",
                 "  You receive     : $1.330 input / $4.180 output per Mtok (95% of retail)",
+                "  Sent as         : 5% off, not the figures above.",
+                "                    The registry resolves them against its own retail.",
             ]
         );
     }

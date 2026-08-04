@@ -57,7 +57,9 @@ out: $4.40 x 9500 / 10000 = $4.180 per Mtok
 ```
 
 `gmcli declare-product` prints the resolved figure for every priced dimension
-and asks you to confirm before it sends anything.
+and asks you to confirm before it sends anything. What it sends is the
+percentage; the registry resolves the figures against its own retail when it
+records the offer.
 
 Your spread is that figure minus whatever DeepInfra charges you for the same
 tokens. `gmcli sources` shows the buyer retail in the `BUYER RETAIL / MTOK`

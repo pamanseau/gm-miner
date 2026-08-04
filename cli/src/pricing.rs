@@ -232,30 +232,32 @@ pub fn format_usd(ndollars: u64) -> String {
     format!("${dollars}.{millis:03}")
 }
 
-/// Render one per-Mtok unit price, widening the fraction rather than rounding
-/// a real price away to `$0.000`.
+/// Render one per-Mtok unit price *exactly*, at whatever precision the value
+/// itself needs.
 ///
 /// [`format_usd`]'s three places suit a whole-request cost, but a unit price
 /// need not reach a tenth of a cent: a cache-read dimension on a cheap model
 /// is fractions of a cent per Mtok, and printing it as `$0.000` would tell the
-/// miner a priced dimension pays nothing. Integer arithmetic throughout — the
-/// fraction is produced by division and remainder, never a float.
+/// miner a priced dimension pays nothing.
+///
+/// The precision comes from the amount's own significant digits, never from a
+/// tier boundary. A tiered formatter picks a width and then truncates
+/// everything below it — `1_999_999` would print as `$0.001` — which shows the
+/// miner *less* than they are paid, the one failure this whole rendering path
+/// exists to prevent. Nano-dollars are the unit's floor, so nine places is
+/// always exact; trailing zeroes are then trimmed back to a minimum of three,
+/// because `$3.000` reads as a price and `$3.` does not.
+///
+/// Integer arithmetic throughout — the fraction is a remainder and a string,
+/// never a float.
 #[must_use]
 pub fn format_per_mtok_usd(ndollars: u64) -> String {
-    // ≥ $0.001, and exact zero, read correctly at three places.
-    if ndollars == 0 || ndollars >= 1_000_000 {
-        return format_usd(ndollars);
-    }
     let dollars = ndollars / 1_000_000_000;
-    if ndollars >= 1_000 {
-        // ≥ $0.000001: six places resolve it.
-        let micros = (ndollars % 1_000_000_000) / 1_000;
-        return format!("${dollars}.{micros:06}");
+    let mut fraction = format!("{:09}", ndollars % 1_000_000_000);
+    while fraction.len() > 3 && fraction.ends_with('0') {
+        fraction.pop();
     }
-    // Below a millionth of a dollar per Mtok: nano-dollars are the floor of
-    // the unit itself, so nine places is exact and cannot lose a digit.
-    let nanos = ndollars % 1_000_000_000;
-    format!("${dollars}.{nanos:09}")
+    format!("${dollars}.{fraction}")
 }
 
 /// One-line summary of the per-Mtok rate the miner will receive on a
@@ -932,15 +934,57 @@ mod tests {
         // telling the miner a priced dimension pays nothing.
         assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
         assert_eq!(format_per_mtok_usd(1_000_000), "$0.001");
-        assert_eq!(format_per_mtok_usd(999_999), "$0.000999");
-        assert_eq!(format_per_mtok_usd(100_000), "$0.000100");
+        assert_eq!(format_per_mtok_usd(100_000), "$0.0001");
         assert_eq!(format_per_mtok_usd(1_000), "$0.000001");
-        assert_eq!(format_per_mtok_usd(999), "$0.000000999");
         assert_eq!(format_per_mtok_usd(1), "$0.000000001");
         // Zero is a real answer, not a rounding artefact, so it stays short.
         assert_eq!(format_per_mtok_usd(0), "$0.000");
         // The whole-request cost formatter keeps its three places.
         assert_eq!(format_usd(999_999), "$0.000");
+    }
+
+    #[test]
+    fn a_unit_price_is_never_truncated_to_a_convenient_width() {
+        // Just above each width a tiered formatter would have chosen. Every
+        // one of these has significant digits below that width, and dropping
+        // them shows the miner less than they are paid.
+        assert_eq!(format_per_mtok_usd(1_999_999), "$0.001999999");
+        assert_eq!(format_per_mtok_usd(1_999), "$0.000001999");
+        assert_eq!(format_per_mtok_usd(999_999), "$0.000999999");
+        assert_eq!(format_per_mtok_usd(999), "$0.000000999");
+        assert_eq!(format_per_mtok_usd(1_000_000_001), "$1.000000001");
+        assert_eq!(format_per_mtok_usd(3_356_250_000), "$3.35625");
+        // Every value round-trips: the rendered digits are the amount.
+        for ndollars in [
+            0_u64,
+            1,
+            999,
+            1_000,
+            1_999,
+            999_999,
+            1_000_000,
+            1_999_999,
+            44_750_000,
+            268_500_000,
+            3_356_250_000,
+            15_000_000_000,
+            u64::MAX,
+        ] {
+            let rendered = format_per_mtok_usd(ndollars);
+            let (dollars, fraction) = rendered
+                .trim_start_matches('$')
+                .split_once('.')
+                .expect("a rendered price always has a decimal point");
+            let scale = 10_u128.pow(9 - u32::try_from(fraction.len()).expect("short fraction"));
+            let reconstructed = u128::from(dollars.parse::<u64>().expect("whole dollars"))
+                * 1_000_000_000
+                + u128::from(fraction.parse::<u64>().expect("fraction digits")) * scale;
+            assert_eq!(
+                reconstructed,
+                u128::from(ndollars),
+                "{rendered} is not {ndollars} ndollars"
+            );
+        }
     }
 
     #[test]
@@ -969,16 +1013,21 @@ mod tests {
         let rendered = extra_dimension_lines(&full_vector(), 1050).join("\n");
         // Labels pad to the widest present, prices right-align so the decimal
         // points line up — $22.500 next to $0.300 is otherwise unreadable.
+        // Every received figure is exact: $0.2685, not a truncated $0.268.
         assert!(
-            rendered.contains("cache read         $0.300 → $0.268"),
+            rendered.contains("cache read              $0.300 → $0.2685"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("cache storage/hr   $0.050 → $0.044"),
+            rendered.contains("cache storage/hr        $0.050 → $0.04475"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("long-ctx output   $22.500 → $20.137"),
+            rendered.contains("long-ctx output        $22.500 → $20.1375"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("audio output      $0.200000003 → $0.179000002"),
             "{rendered}"
         );
         // The anchors are on the summary line; repeating them here would
