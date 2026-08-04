@@ -19,7 +19,7 @@ use crate::commands::deploy::{
 use crate::commands::hotkey::cmd_register_hotkey;
 use crate::commands::keys::{cmd_set_api_keys, FoundryArgs};
 use crate::commands::persist::{cmd_login, ensure_fresh_token, load_config};
-use crate::commands::products::cmd_declare_products;
+use crate::commands::products::{cmd_declare_products, DeclareOutcome};
 
 /// Whether the wizard should keep going (`Continue`) or stop here (`Stop`).
 ///
@@ -443,19 +443,33 @@ async fn wizard_declare_products(cfg: Config, assume_yes: bool) -> Result<Wizard
     };
     let pct = format_discount_pct(discount_bp);
     let command = format!("gmcli declare-products --discount-pct {pct}");
-    run_wizard_step!(
-        title,
-        &command,
-        assume_yes,
-        declare_all_products(cfg, discount_bp, assume_yes).await
-    )
+    // Not `run_wizard_step!`: that macro discards the step's value, and this
+    // step has a third outcome. The miner can accept the step, read the prices
+    // the discount works out to, and then decline — at which point nothing was
+    // declared and saying so is the whole point of having asked.
+    match ask_step(title, &command, assume_yes)? {
+        StepChoice::Run => {
+            if declare_all_products(cfg, discount_bp, assume_yes).await?
+                == DeclareOutcome::Cancelled
+            {
+                println!("  Step skipped — no offers declared. Run `{command}` when ready.");
+            }
+            Ok(WizardFlow::Continue)
+        }
+        StepChoice::Skip => Ok(WizardFlow::Continue),
+        StepChoice::Stop => Ok(WizardFlow::Stop),
+    }
 }
 
 /// Refresh the token, then fan the discount across the catalog. The token
 /// refresh is folded in here (the wizard's other steps go through `dispatch`,
 /// which refreshes before the command; the declare step calls the command
 /// directly, so it does its own refresh).
-async fn declare_all_products(cfg: Config, discount_bp: u32, assume_yes: bool) -> Result<()> {
+async fn declare_all_products(
+    cfg: Config,
+    discount_bp: u32,
+    assume_yes: bool,
+) -> Result<DeclareOutcome> {
     let mut client = gm_miner_cli::client::RegistryClient::new(ensure_fresh_token(cfg).await?);
     cmd_declare_products(&mut client, None, discount_bp, assume_yes).await
 }

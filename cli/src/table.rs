@@ -33,6 +33,21 @@ use std::fmt::Write as _;
 ///
 /// Cells beyond `headers.len()` are ignored, and a short row is padded out, so
 /// a caller cannot produce a ragged table by miscounting.
+///
+/// # Preconditions
+///
+/// **Every cell must be a single line of printable text.** A cell holding a
+/// newline breaks one row into several physical lines while the character
+/// counts stay uniform, and a tab or an escape sequence advances the cursor by
+/// something other than its character count — either way the table renders
+/// ragged, or a crafted cell could draw a convincing fake row. Nothing is
+/// stripped here, for the same reason nothing measures glyph width: every cell
+/// the CLI puts in a table is a provider enum, a generated label, a formatted
+/// price, or a model id that has to survive URL-path interpolation, so none of
+/// them can carry a control character today. Sanitising would be dead code
+/// guarding a case the callers make impossible. If a table ever renders a
+/// free-text field — a registry-supplied reason string, say — that field is
+/// where the escaping belongs, and this precondition is the reason why.
 #[must_use]
 pub fn render(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();

@@ -34,10 +34,15 @@ use crate::commands::{get_me_json, sources::fetch_sources, status_error};
 /// registry keeps those out of the buyer-facing `GET /products` — so the
 /// miner's routes are consulted before the declaration is rejected.
 ///
-/// The resolved per-dimension prices are printed and confirmed *before* the
-/// POST, so the miner sees the absolute figures a percentage works out to
-/// rather than agreeing to an expression. What is *sent* is still the
-/// percentage — see [`sent_as_lines`] for why the prompt says so.
+/// The per-dimension prices the discount works out to at current retail are
+/// printed *before* the POST, so the miner sees what a percentage means rather
+/// than being asked to price it in their head. The prompt itself asks about
+/// the percentage, because that is all the wire carries — see
+/// [`sent_as_lines`].
+///
+/// Unlike [`cmd_declare_products`] this returns no outcome: `dispatch` is its
+/// only caller, it prints its own cancellation, and a declined confirmation is
+/// a successful exit for a CLI run that was asked to do nothing.
 pub(crate) async fn cmd_declare_product(
     client: &mut RegistryClient,
     provider: &Provider,
@@ -246,15 +251,18 @@ fn declaration_lines(
 /// 1. Public `GET /products` discovers every active product.
 /// 2. If `provider_filter` is set, drops products from other providers.
 /// 3. Drops deprecated products (the registry rejects offers on them anyway).
-/// 4. Prints the resolved per-dimension prices for every target and asks the
-///    miner to confirm them, because those absolutes are what the offer is.
+/// 4. Prints the per-dimension prices the discount works out to at current
+///    retail, and asks the miner to confirm the discount.
 /// 5. POSTs one offer per surviving product. Each result is printed
 ///    individually (`provider/model: N% → ok|ERROR …`).
 /// 6. Reports a final ok/err summary.
 ///
-/// Per-product failures do not abort the loop. The function returns `Ok(())`
-/// when every POST succeeded and an aggregated error otherwise so the CLI
-/// exits non-zero on partial failure.
+/// Per-product failures do not abort the loop. The function returns
+/// [`DeclareOutcome::Declared`] when every POST succeeded, an aggregated error
+/// otherwise so the CLI exits non-zero on partial failure, and
+/// [`DeclareOutcome::Cancelled`] when the miner declined the confirmation —
+/// which is neither a success nor a failure, and which a caller driving this
+/// as one step of a longer flow must be able to tell apart.
 ///
 /// Deliberately catalog-only: sourcing routes are not swept in here. A source
 /// offer commits the miner to buying from a specific upstream with a key it
@@ -265,7 +273,7 @@ pub(crate) async fn cmd_declare_products(
     provider_filter: Option<&Provider>,
     discount_bp: u32,
     assume_yes: bool,
-) -> Result<()> {
+) -> Result<DeclareOutcome> {
     let catalog = fetch_catalog(client).await?;
     let targets = filter_catalog(&catalog.products, provider_filter);
 
@@ -288,7 +296,7 @@ pub(crate) async fn cmd_declare_products(
         assume_yes,
     )? {
         println!("Not declared — nothing was sent.");
-        return Ok(());
+        return Ok(DeclareOutcome::Cancelled);
     }
 
     let mut ok_count = 0_usize;
@@ -313,7 +321,19 @@ pub(crate) async fn cmd_declare_products(
         bail!("{err_count} of {} declarations failed", targets.len());
     }
     println!("Next: gmcli status   (confirm offers + eligibility)");
-    Ok(())
+    Ok(DeclareOutcome::Declared)
+}
+
+/// Whether a declaration actually reached the registry.
+///
+/// A declined confirmation is not a failure — nothing is wrong, the miner said
+/// no — but it is emphatically not a success either, and collapsing the two
+/// into `Ok(())` let `gmcli init` mark its final step complete and print
+/// "All set" having declared nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclareOutcome {
+    Declared,
+    Cancelled,
 }
 
 /// What the fan-out is about to commit to, one product per line, with the
@@ -1055,11 +1075,16 @@ mod tests {
         .await;
 
         let mut client = RegistryClient::new(config_for(&server));
-        cmd_declare_products(&mut client, Some(&Provider::Anthropic), 500, false)
+        let outcome = cmd_declare_products(&mut client, Some(&Provider::Anthropic), 500, false)
             .await
             .expect("a non-interactive fan-out declares without a --yes");
 
         assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+        // The outcome must match what actually happened, in both directions:
+        // `Cancelled` here would make `gmcli init` announce a skipped step
+        // after declaring, exactly as `Ok(())` on a real cancellation made it
+        // announce "All set" after declaring nothing.
+        assert_eq!(outcome, DeclareOutcome::Declared);
     }
 
     #[test]
@@ -1184,8 +1209,13 @@ mod tests {
 
         assert!(rendered.contains("Priced beyond input/output"));
         assert!(rendered.contains("anthropic/claude-sonnet-4-6"));
+        // `ends_with` on the whole line, not `contains`: a `contains("$0.268")`
+        // matches the truncated figure as happily as the correct `$0.2685`,
+        // which is precisely how the truncation survived its first review.
         assert!(
-            rendered.contains("cache read  $0.300 → $0.268"),
+            rendered
+                .lines()
+                .any(|line| line.ends_with("cache read  $0.300 → $0.2685")),
             "{rendered}"
         );
         assert!(!rendered.contains("glm-5.2"), "{rendered}");
@@ -1242,8 +1272,13 @@ mod tests {
             rendered.contains("anthropic/claude-sonnet-4-6: $2.685 in / $13.425 out per Mtok"),
             "{rendered}"
         );
+        // `ends_with` on the whole line, not `contains`: a `contains("$0.268")`
+        // matches the truncated figure as happily as the correct `$0.2685`,
+        // which is precisely how the truncation survived its first review.
         assert!(
-            rendered.contains("cache read  $0.300 → $0.268"),
+            rendered
+                .lines()
+                .any(|line| line.ends_with("cache read  $0.300 → $0.2685")),
             "{rendered}"
         );
         assert!(

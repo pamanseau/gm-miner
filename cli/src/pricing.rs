@@ -4,10 +4,12 @@
 //!
 //! Prices are a *vector*, not a pair: a product prices input and output plus
 //! up to eight further dimensions (prompt cache, audio, long context). A
-//! percent discount is the ergonomic way to express an offer, but it is
-//! resolved here into the absolute per-dimension figures the miner confirms —
-//! see [`effective_dimensions`]. [`PRICE_DIMENSIONS`] is the one list of
-//! dimensions the arithmetic and the rendering both walk.
+//! percent discount is the ergonomic way to express an offer, and
+//! [`effective_dimensions`] resolves it into the absolute per-dimension
+//! figures the miner is shown before declaring. Shown, not agreed: the wire
+//! carries the percentage, and the registry re-resolves it against its own
+//! retail. [`PRICE_DIMENSIONS`] is the one list of dimensions the arithmetic
+//! and the rendering both walk.
 
 use anyhow::Result;
 
@@ -23,9 +25,10 @@ pub const MAX_DISCOUNT_BP: u32 = 9_990;
 /// clap `value_parser` for `--discount-pct`.
 ///
 /// Parses a percent string with up to two decimal places into an integer
-/// basis-point value without floating-point arithmetic. The percentage is the
-/// input ergonomics only — [`effective_dimensions`] resolves it against the
-/// product's retail vector, and the miner confirms the absolute figures.
+/// basis-point value without floating-point arithmetic. The result is both
+/// what the miner is asked to confirm and what the request body carries;
+/// [`effective_dimensions`] resolves it against the product's retail vector
+/// only so the figures can be shown alongside.
 ///
 /// # Errors
 ///
@@ -204,9 +207,12 @@ const PRICE_DIMENSIONS: [PriceDimension; 10] = [
 /// `long_context_threshold_tokens` is copied verbatim because it is a token
 /// count and not money.
 ///
-/// This is what `declare-product` shows the miner before it sends. A stored
-/// percentage would leave the miner's price moving whenever retail moved; the
-/// absolute vector is the thing they are agreeing to.
+/// This is what `declare-product` shows the miner before it sends, so a
+/// percentage does not have to be priced in the head. It is *not* what the
+/// miner agrees to: the request body carries `discount_bp` alone, and the
+/// registry re-resolves the vector against its own retail when it records the
+/// offer. `commands::products::sent_as_lines` says so in the output and
+/// explains what would have to change for these figures to be the commitment.
 #[must_use]
 pub fn effective_dimensions(retail: &RetailDimensions, discount_bp: u32) -> RetailDimensions {
     let mut effective = retail.clone();
@@ -700,26 +706,37 @@ mod tests {
         // holds however far the data rows overflow — that is why the fixed
         // 12-char cost columns survived unnoticed once prices stopped being
         // truncated to three decimals. Assert every line.
+        //
+        // Calibration matters as much as the assertion. Every non-cost cell
+        // below sits comfortably inside the width this table used to hardcode
+        // (PROVIDER 12, MODEL 32, YOUR RANK 12, DISCOUNT 10) and every cost
+        // cell exceeds the 12 the cost columns had, so the test fails if and
+        // only if a cost column is re-capped. A long model id would make it
+        // fail for the wrong reason and hide a re-capped cost column.
+        assert!(
+            format_usd(u64::MAX).len() > 12,
+            "the cost values must exceed the width being guarded against"
+        );
         let field = products(serde_json::json!([
             {
-                "provider": "chutes", "model": "a-very-cheap-model-with-a-long-id",
+                "provider": "openai", "model": "gpt-5.6",
                 "competitor_count": 3,
-                "best_cost_ndollars": 999_999_u64,
-                "median_cost_ndollars": 1_999_999_u64,
+                "best_cost_ndollars": 9_999_999_999_999_999_999_u64,
+                "median_cost_ndollars": 1_234_567_890_123_456_789_u64,
                 "offered_by_you": true,
-                "your_cost_ndollars": 1_999_998_u64,
+                "your_cost_ndollars": u64::MAX,
                 "your_discount_bp": 500,
                 "your_rank": 2,
             },
             {
-                "provider": "anthropic", "model": "claude-sonnet-4-6",
-                "competitor_count": 5,
-                "best_cost_ndollars": 16_200_000_000_u64,
-                "median_cost_ndollars": 18_000_000_000_u64,
+                "provider": "zai", "model": "glm-5.2",
+                "competitor_count": 2,
+                "best_cost_ndollars": 3_000_000_000_u64,
+                "median_cost_ndollars": 4_000_000_000_u64,
                 "offered_by_you": true,
-                "your_cost_ndollars": 18_000_000_000_u64,
-                "your_discount_bp": 500,
-                "your_rank": 3,
+                "your_cost_ndollars": 4_000_000_000_u64,
+                "your_discount_bp": 1_000,
+                "your_rank": 1,
             },
         ]));
         let lines = rank_table(&field.iter().collect::<Vec<_>>());
@@ -734,17 +751,25 @@ mod tests {
             );
         }
 
-        // The widest cost cell is present in full, and MEDIAN still starts
-        // where its header does on every row.
+        // Every cost is present in full, and MEDIAN still starts where its
+        // header does on both the wide row and the narrow one.
         let rendered = lines.join("\n");
-        assert!(rendered.contains("$0.001999998"), "{rendered}");
-        assert!(rendered.contains("$0.000999999"), "{rendered}");
+        for expected in [
+            "$18446744073.709551615",
+            "$9999999999.999999999",
+            "$1234567890.123456789",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}:\n{rendered}"
+            );
+        }
         let median_at = lines[0].find("MEDIAN").expect("the header names MEDIAN");
         assert!(
-            lines[2][median_at..].starts_with("$0.001999999"),
+            lines[2][median_at..].starts_with("$1234567890.123456789"),
             "{rendered}"
         );
-        assert!(lines[3][median_at..].starts_with("$18.000"), "{rendered}");
+        assert!(lines[3][median_at..].starts_with("$4.000"), "{rendered}");
     }
 
     #[test]
@@ -1065,23 +1090,19 @@ mod tests {
         let rendered = extra_dimension_lines(&full_vector(), 1050).join("\n");
         // Labels pad to the widest present, prices right-align so the decimal
         // points line up — $22.500 next to $0.300 is otherwise unreadable.
-        // Every received figure is exact: $0.2685, not a truncated $0.268.
-        assert!(
-            rendered.contains("cache read              $0.300 → $0.2685"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("cache storage/hr        $0.050 → $0.04475"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("long-ctx output        $22.500 → $20.1375"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("audio output      $0.200000003 → $0.179000002"),
-            "{rendered}"
-        );
+        // Matched to the end of the line rather than by `contains`, so a
+        // truncated `$0.268` cannot satisfy an assertion written for $0.2685.
+        for expected in [
+            "cache read              $0.300 → $0.2685",
+            "cache storage/hr        $0.050 → $0.04475",
+            "long-ctx output        $22.500 → $20.1375",
+            "audio output      $0.200000003 → $0.179000002",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line.ends_with(expected)),
+                "missing {expected:?} in:\n{rendered}"
+            );
+        }
         // The anchors are on the summary line; repeating them here would
         // double-count the two dimensions that matter most.
         assert!(!rendered.contains("$3.000 → $2.685"), "{rendered}");

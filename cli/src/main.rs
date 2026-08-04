@@ -922,7 +922,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = load_config(explicit_network, api_url)?;
             let cfg = ensure_fresh_token(cfg).await?;
             let mut client = RegistryClient::new(cfg);
-            cmd_declare_products(&mut client, provider.as_ref(), discount_bp, yes).await
+            // A declined confirmation exits 0: the miner asked for nothing to
+            // happen and nothing did. Only `init` branches on the outcome,
+            // because only it goes on to claim the step is done.
+            cmd_declare_products(&mut client, provider.as_ref(), discount_bp, yes)
+                .await
+                .map(|_| ())
         }
         Command::UndeclareProduct { provider, model } => {
             let cfg = load_config(explicit_network, api_url)?;
