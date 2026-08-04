@@ -583,8 +583,16 @@ fn prompt_discount(assume_yes: bool) -> Result<Option<u32>> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test assertions intentionally panic on unexpected values"
+)]
 mod tests {
-    use super::{closing_lines, record, StepOutcome, WizardFlow};
+    use super::{
+        closing_lines, record, run_steps, wizard_declare_products, wizard_deploy, wizard_login,
+        wizard_provider_keys, wizard_register_hotkey, Config, StepOutcome, WizardFlow,
+    };
 
     /// The banner that must appear if and only if onboarding actually finished.
     const SUCCESS_BANNER: &str = "All set";
@@ -686,6 +694,163 @@ mod tests {
         assert!(!rendered.contains(SUCCESS_BANNER), "{rendered}");
         assert!(!rendered.contains("Outstanding from"), "{rendered}");
         assert!(rendered.contains("Re-run `gmcli init`"), "{rendered}");
+    }
+
+    // ── the real step mappings ───────────────────────────────────────────
+    //
+    // The tests above inject synthetic outcomes, which pins `closing_lines`
+    // but not what feeds it: reverting any step's early return to `Done`
+    // leaves them green. These drive the real step functions.
+    //
+    // `assume_yes` stands in for a non-interactive stdin throughout — both
+    // short-circuit the same prompts — so nothing here blocks on input.
+
+    /// `GMCLI_CONFIG_DIR` is process-global, so tests that mutate it must not
+    /// run concurrently. Serialise them on a local mutex, and clear the
+    /// override on drop even if the test panics.
+    static CONFIG_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ConfigDirGuard {
+        /// Held to serialise env mutation; never read.
+        _lock: std::sync::MutexGuard<'static, ()>,
+        /// Owns the tempdir so it outlives the test; never read.
+        _dir: tempfile::TempDir,
+    }
+
+    impl ConfigDirGuard {
+        fn new() -> Self {
+            let lock = CONFIG_DIR_ENV
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            // The held lock serialises this against every other env mutation in
+            // this test binary. No `unsafe` block: the bin crate is
+            // `#![forbid(unsafe_code)]`, and on edition 2021 `set_var` is
+            // still callable directly.
+            std::env::set_var("GMCLI_CONFIG_DIR", dir.path());
+            Self {
+                _lock: lock,
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // Still holding the lock until after this returns.
+            std::env::remove_var("GMCLI_CONFIG_DIR");
+        }
+    }
+
+    /// A miner at the very start: no hotkey, no token, no keys, no worker.
+    fn fresh_config() -> Config {
+        Config {
+            active_network: Some("testnet".to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn command_of(outcome: &StepOutcome) -> &str {
+        match outcome {
+            StepOutcome::Outstanding(command) => command,
+            other => panic!("expected an outstanding step, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_register_step_with_no_input_is_outstanding() {
+        let outcome = wizard_register_hotkey(&fresh_config(), true).expect("step runs");
+        assert!(
+            command_of(&outcome).starts_with("gmcli register-hotkey"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_keys_step_with_no_keys_entered_is_outstanding() {
+        let outcome = wizard_provider_keys(None, &fresh_config(), true).expect("step runs");
+        assert_eq!(command_of(&outcome), "gmcli set-api-keys");
+    }
+
+    #[tokio::test]
+    async fn a_deploy_step_blocked_on_a_missing_provider_key_is_outstanding() {
+        let outcome = wizard_deploy(fresh_config(), true)
+            .await
+            .expect("step runs");
+        assert_eq!(command_of(&outcome), "gmcli deploy");
+    }
+
+    #[tokio::test]
+    async fn a_declare_step_with_no_discount_entered_is_outstanding() {
+        let outcome = wizard_declare_products(fresh_config(), true)
+            .await
+            .expect("step runs");
+        assert_eq!(
+            command_of(&outcome),
+            "gmcli declare-products --discount-pct <pct>"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_step_that_cannot_run_unattended_is_outstanding() {
+        let _guard = ConfigDirGuard::new();
+        let outcome = wizard_login(None, None, true).await.expect("step runs");
+        assert_eq!(command_of(&outcome), "gmcli login");
+    }
+
+    #[tokio::test]
+    async fn a_deploy_step_over_a_registered_worker_is_done_not_outstanding() {
+        // The other direction: a step that is genuinely satisfied must report
+        // `Done`, or every run would hold back the banner and the summary
+        // would be as wrong as the one it replaced — just wrong the other way.
+        let mut cfg = fresh_config();
+        cfg.networks
+            .entry("testnet".to_owned())
+            .or_default()
+            .workers
+            .push(gm_miner_cli::config::WorkerRecord {
+                worker_id: "worker-1".to_owned(),
+                ..Default::default()
+            });
+
+        assert_eq!(
+            wizard_deploy(cfg, true).await.expect("step runs"),
+            StepOutcome::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_finishes_nothing_reaches_the_closing_summary_without_the_banner() {
+        // The composition, through the real steps and the real fold: a fresh
+        // miner who supplies no input finishes none of the five, and the
+        // summary that follows must not claim success. This is what a
+        // synthetic-outcome test cannot catch — reverting any step's early
+        // return to `Done` drops it from this list and the count fails.
+        let _guard = ConfigDirGuard::new();
+        let (outstanding, stopped) = run_steps(None, None, fresh_config(), true)
+            .await
+            .expect("a fully non-interactive run completes");
+
+        assert!(!stopped, "nothing answered `n`");
+        assert_eq!(outstanding.len(), 5, "{outstanding:?}");
+        for expected in [
+            "gmcli register-hotkey",
+            "gmcli login",
+            "gmcli set-api-keys",
+            "gmcli deploy",
+            "gmcli declare-products",
+        ] {
+            assert!(
+                outstanding.iter().any(|c| c.starts_with(expected)),
+                "missing {expected}: {outstanding:?}"
+            );
+        }
+
+        let rendered = closing_lines(&outstanding, stopped).join("\n");
+        assert!(
+            !rendered.contains(SUCCESS_BANNER),
+            "a run that finished nothing must not claim success:\n{rendered}"
+        );
     }
 
     #[test]
