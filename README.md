@@ -247,6 +247,17 @@ gmcli declare-product --provider anthropic --model claude-sonnet-4-6 --discount-
 Use `--upstream-model` only when the upstream expects a different id, typically Bedrock. Azure
 deployments named exactly like the gm model id do not need it.
 
+Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
+you would receive on **every dimension the product prices** — input and output, plus prompt
+cache, audio and long-context rates where the model has them — print those figures, and ask you
+to confirm. Dimensions a model does not price are not listed. Pass `--yes` to skip the prompt;
+a non-interactive stdin skips it too, so scripted declarations keep working unchanged.
+
+What is sent is the percentage, not those figures: the registry resolves them against its own
+retail when it records the offer, so the printed numbers are "at current retail" and a retail
+change in between moves what you are paid. The output says so, and `gmcli status` shows the
+rate each standing offer is actually on.
+
 To see the buyer products you can serve from a cheaper upstream — and the pre-filled
 `declare-product` line for each:
 

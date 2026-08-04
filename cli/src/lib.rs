@@ -16,6 +16,7 @@ pub mod phala;
 pub mod pricing;
 pub mod register_hotkey;
 pub mod slots;
+pub mod table;
 pub mod terms;
 pub mod types;
 pub mod wizard;

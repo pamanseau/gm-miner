@@ -91,8 +91,8 @@ impl std::str::FromStr for Provider {
 
 /// One entry in the registry product catalog (`GET /products`).
 ///
-/// `retail_price` carries the two anchor dimensions the CLI needs to show
-/// the miner the effective per-Mtok rate they'll receive after applying
+/// `retail_price` carries the per-dimension price vector the CLI needs to
+/// show the miner the effective per-Mtok rate they'll receive after applying
 /// their declared discount. Other retail fields are intentionally
 /// ignored — the CLI doesn't bill, the gateway does.
 #[derive(Debug, Clone, Deserialize)]
@@ -111,12 +111,48 @@ pub struct RetailPrice {
     pub dimensions: RetailDimensions,
 }
 
-/// The two anchor per-Mtok dimensions every product carries. Used to
-/// render the effective miner payout per request.
-#[derive(Debug, Clone, Deserialize)]
+/// A product's full per-dimension price vector, mirroring
+/// `$defs/PriceDimensions` in the gm repo's `shared/schemas/product.json`.
+///
+/// Input and output are required there — every product prices both. Every
+/// other dimension is nullable, and null means the model does not price it:
+/// a model with no prompt cache carries no `cache_read`, and rendering `$0.000`
+/// for it would read as "free" rather than "not offered".
+///
+/// [`long_context_threshold_tokens`](Self::long_context_threshold_tokens) is
+/// the odd one out — a token count, not a price. It says where the
+/// long-context tier begins, and no discount is ever applied to it.
+///
+/// Decoding is deliberately not `deny_unknown_fields`: a registry that adds a
+/// dimension this build predates still decodes cleanly, it simply does not
+/// render the new one. Every optional field carries `#[serde(default)]` so a
+/// registry that omits it entirely — rather than sending an explicit null —
+/// decodes too.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RetailDimensions {
     pub input_per_mtok_ndollars: u64,
     pub output_per_mtok_ndollars: u64,
+    #[serde(default)]
+    pub cache_read_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub cache_write_5m_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub cache_write_1h_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub audio_input_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub audio_output_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub cache_storage_per_mtok_hour_ndollars: Option<u64>,
+    /// Input-token count above which the long-context tier applies. Not a
+    /// price — carried so the long-context rows can say what they are the
+    /// price *of*.
+    #[serde(default)]
+    pub long_context_threshold_tokens: Option<u64>,
+    #[serde(default)]
+    pub long_context_input_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub long_context_output_per_mtok_ndollars: Option<u64>,
 }
 
 /// Wrapper response shape returned by `GET /products` (`ProductCatalogResponse`).
@@ -235,6 +271,14 @@ pub struct PricingCompetitiveness {
 /// every dimension; range `[0, 9990]` (the upper cap leaves the miner with
 /// strictly positive revenue). See `docs/plans/miner-pct-discount-pricing.md`
 /// §3.1 in the gm repo for the math.
+///
+/// The registry's schema is `additionalProperties: false`, so this is the
+/// whole wire body: the absolute per-dimension vector the CLI resolves and
+/// shows the miner before it sends
+/// ([`pricing::effective_dimensions`](crate::pricing::effective_dimensions))
+/// stays client-side until the registry accepts it. Sending it then is one
+/// field here plus the already-resolved vector at the two call sites in
+/// `commands::products`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductDeclarationRequest<'a> {
     pub provider: &'a str,

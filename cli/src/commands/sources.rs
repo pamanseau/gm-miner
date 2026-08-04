@@ -2,15 +2,14 @@
 //! `GET /miners/products/sources` fetch that `declare-product` resolves
 //! against.
 
-use std::fmt::Write as _;
-
 use anyhow::{Context as _, Result};
 
 use gm_miner_cli::{
     client::RegistryClient,
     network::Network,
-    pricing::format_per_mtok_usd,
-    types::{SourceProduct, SourceProductsResponse},
+    pricing::{extra_dimension_count, format_usd},
+    table,
+    types::{RetailDimensions, SourceProduct, SourceProductsResponse},
 };
 
 use crate::commands::status_error;
@@ -76,29 +75,13 @@ pub(crate) async fn fetch_sources(client: &mut RegistryClient) -> Result<SourceL
     Ok(SourceLookup::Routes(body.sources))
 }
 
-const SOURCE_COLUMNS: [(&str, usize); 5] = [
-    ("ROUTE", 38),
-    ("SERVES", 22),
-    ("BUYER RETAIL / MTOK", 26),
-    ("YOU SERVE", 16),
-    ("OFFERED", 7),
+const SOURCE_HEADERS: [&str; 5] = [
+    "ROUTE",
+    "SERVES",
+    "BUYER RETAIL / MTOK",
+    "YOU SERVE",
+    "OFFERED",
 ];
-
-fn source_row(cells: &[String; 5]) -> String {
-    let mut row = String::new();
-    for (i, ((_, width), cell)) in SOURCE_COLUMNS.iter().zip(cells).enumerate() {
-        if i > 0 {
-            row.push(' ');
-        }
-        let _ = write!(row, "{cell:<width$}");
-    }
-    row
-}
-
-fn source_rule() -> String {
-    let cells: usize = SOURCE_COLUMNS.iter().map(|&(_, width)| width).sum();
-    "-".repeat(cells + SOURCE_COLUMNS.len() - 1)
-}
 
 /// A no-table result: the two lines of `why`, then the shared tail. Both empty
 /// states end at the same two pointers, so a third cannot forget the doc link.
@@ -144,28 +127,41 @@ fn render_sources(network: Network, lookup: &SourceLookup) -> Vec<String> {
         "product's retail less your discount, so the gap between that and what the".to_owned(),
         "upstream charges you is your spread.".to_owned(),
         String::new(),
-        source_row(&SOURCE_COLUMNS.map(|(name, _)| name.to_owned())),
-        source_rule(),
     ];
-    lines.extend(sources.iter().map(route_line));
+    let rows: Vec<Vec<String>> = sources.iter().map(route_row).collect();
+    lines.extend(table::render(&SOURCE_HEADERS, &rows));
     lines.extend(unserved_lines(sources));
     lines.extend(declare_lines(sources));
     lines
 }
 
-fn route_line(source: &SourceProduct) -> String {
+fn route_row(source: &SourceProduct) -> Vec<String> {
     let retail = &source.retail_price.dimensions;
-    source_row(&[
+    vec![
         format!("{}/{}", source.provider, source.model),
         format!("{}/{}", source.buyer_provider, source.buyer_model),
-        format!(
-            "{} in / {} out",
-            format_per_mtok_usd(retail.input_per_mtok_ndollars),
-            format_per_mtok_usd(retail.output_per_mtok_ndollars),
-        ),
+        buyer_retail_cell(retail),
         serving_cell(source.capable_worker_count),
         if source.already_offered { "yes" } else { "no" }.to_owned(),
-    ])
+    ]
+}
+
+/// The buyer product's retail anchors, plus a count of the dimensions it
+/// prices beyond them.
+///
+/// Settlement is on the buyer product's whole price vector, not just input and
+/// output, so a route whose buyer product prices a prompt cache has to say so —
+/// `gmcli declare-product` then prints every dimension in full.
+fn buyer_retail_cell(retail: &RetailDimensions) -> String {
+    let anchors = format!(
+        "{} in / {} out",
+        format_usd(retail.input_per_mtok_ndollars),
+        format_usd(retail.output_per_mtok_ndollars),
+    );
+    match extra_dimension_count(retail) {
+        0 => anchors,
+        n => format!("{anchors} +{n}"),
+    }
 }
 
 fn serving_cell(capable_worker_count: u32) -> String {
@@ -252,10 +248,7 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
-    use super::{
-        fetch_sources, render_sources, source_row, source_rule, Network, SourceLookup,
-        SOURCE_COLUMNS,
-    };
+    use super::{fetch_sources, render_sources, Network, SourceLookup};
 
     fn sources(value: serde_json::Value) -> SourceLookup {
         SourceLookup::Routes(serde_json::from_value(value).expect("decode sourcing routes"))
@@ -305,9 +298,55 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_is_exactly_as_wide_as_a_row() {
-        let row = source_row(&SOURCE_COLUMNS.map(|(name, _)| name.to_owned()));
-        assert_eq!(source_rule().chars().count(), row.chars().count());
+    fn every_route_row_is_the_width_of_the_rule_not_just_the_header() {
+        // Same defect as the rank table: the old test compared the rule
+        // against the header alone, so a retail cell wider than its column
+        // passed. A cheap buyer product pricing a full vector is the case.
+        let rendered = render_sources(
+            Network::Mainnet,
+            &sources(serde_json::json!([
+                deepinfra_glm(1, false),
+                {
+                    "provider": "chutes",
+                    "model": "some-org/a-very-cheap-model",
+                    "buyer_provider": "zai",
+                    "buyer_model": "glm-5.2-air",
+                    "retail_price": {
+                        "dimensions": {
+                            "input_per_mtok_ndollars": 999_999_u64,
+                            "output_per_mtok_ndollars": 999_u64,
+                            "cache_read_per_mtok_ndollars": 500_u64,
+                            "cache_write_5m_per_mtok_ndollars": 500_u64,
+                        },
+                    },
+                    "capable_worker_count": 1,
+                    "already_offered": false,
+                },
+            ])),
+        );
+
+        // The table block is header, rule, then one line per route.
+        let start = rendered
+            .iter()
+            .position(|line| line.starts_with("ROUTE"))
+            .expect("the table has a header");
+        let table = &rendered[start..start + 4];
+        let width = table[0].chars().count();
+        for line in table {
+            assert_eq!(
+                line.chars().count(),
+                width,
+                "row is not the table's width:\n{}",
+                table.join("\n")
+            );
+        }
+        assert!(
+            table
+                .join("\n")
+                .contains("$0.000999999 in / $0.000000999 out +2"),
+            "{}",
+            table.join("\n")
+        );
     }
 
     #[test]
