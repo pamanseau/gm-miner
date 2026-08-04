@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use gm_miner_cli::{
     client::RegistryClient,
     network::Network,
-    pricing::{extra_dimension_count, format_per_mtok_usd},
+    pricing::{extra_dimension_count, format_usd},
     types::{RetailDimensions, SourceProduct, SourceProductsResponse},
 };
 
@@ -173,8 +173,8 @@ fn route_line(source: &SourceProduct) -> String {
 fn buyer_retail_cell(retail: &RetailDimensions) -> String {
     let anchors = format!(
         "{} in / {} out",
-        format_per_mtok_usd(retail.input_per_mtok_ndollars),
-        format_per_mtok_usd(retail.output_per_mtok_ndollars),
+        format_usd(retail.input_per_mtok_ndollars),
+        format_usd(retail.output_per_mtok_ndollars),
     );
     match extra_dimension_count(retail) {
         0 => anchors,

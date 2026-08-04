@@ -222,36 +222,28 @@ pub fn effective_dimensions(retail: &RetailDimensions, discount_bp: u32) -> Reta
     effective
 }
 
-/// Render an ndollar amount as dollars with 3 decimal places (e.g.
-/// `2_685_000_000 → "$2.685"`). One nano-dollar is `10^-9` USD; a tenth of a
-/// cent is the resolution the operator actually cares about.
-#[must_use]
-pub fn format_usd(ndollars: u64) -> String {
-    let dollars = ndollars / 1_000_000_000;
-    let millis = (ndollars % 1_000_000_000) / 1_000_000;
-    format!("${dollars}.{millis:03}")
-}
-
-/// Render one per-Mtok unit price *exactly*, at whatever precision the value
-/// itself needs.
+/// Render an ndollar amount *exactly*, at whatever precision the value itself
+/// needs (e.g. `2_685_000_000 → "$2.685"`, `999_999 → "$0.000999999"`).
 ///
-/// [`format_usd`]'s three places suit a whole-request cost, but a unit price
-/// need not reach a tenth of a cent: a cache-read dimension on a cheap model
-/// is fractions of a cent per Mtok, and printing it as `$0.000` would tell the
-/// miner a priced dimension pays nothing.
+/// The one money formatter: every price the CLI prints goes through here.
+/// There is deliberately no shorter variant to reach for. Three decimal places
+/// look like enough for a whole-request cost right up until the model is a
+/// cheap one — a reference request against `chutes` is genuinely sub-milli-
+/// dollar — and then two distinct competitor costs render identically, or a
+/// real cost renders as free, in `gmcli pricing`, the one view whose entire
+/// job is deciding what to charge against the field.
 ///
-/// The precision comes from the amount's own significant digits, never from a
-/// tier boundary. A tiered formatter picks a width and then truncates
-/// everything below it — `1_999_999` would print as `$0.001` — which shows the
-/// miner *less* than they are paid, the one failure this whole rendering path
-/// exists to prevent. Nano-dollars are the unit's floor, so nine places is
-/// always exact; trailing zeroes are then trimmed back to a minimum of three,
-/// because `$3.000` reads as a price and `$3.` does not.
+/// So precision comes from the amount's own significant digits, never from a
+/// fixed width or a tier boundary: a tiered formatter picks a width and
+/// truncates everything below it (`1_999_999` → `$0.001`), which shows the
+/// miner *less* than the true figure. Nano-dollars are the unit's floor, so
+/// nine places is always exact; trailing zeroes then trim back to a minimum of
+/// three, because `$3.000` reads as a price and `$3.` does not.
 ///
 /// Integer arithmetic throughout — the fraction is a remainder and a string,
 /// never a float.
 #[must_use]
-pub fn format_per_mtok_usd(ndollars: u64) -> String {
+pub fn format_usd(ndollars: u64) -> String {
     let dollars = ndollars / 1_000_000_000;
     let mut fraction = format!("{:09}", ndollars % 1_000_000_000);
     while fraction.len() > 3 && fraction.ends_with('0') {
@@ -274,8 +266,8 @@ pub fn effective_rate_summary(retail: &RetailDimensions, discount_bp: u32) -> St
     let effective = effective_dimensions(retail, discount_bp);
     let summary = format!(
         "{} in / {} out per Mtok",
-        format_per_mtok_usd(effective.input_per_mtok_ndollars),
-        format_per_mtok_usd(effective.output_per_mtok_ndollars)
+        format_usd(effective.input_per_mtok_ndollars),
+        format_usd(effective.output_per_mtok_ndollars)
     );
     match extra_dimension_count(retail) {
         0 => summary,
@@ -321,7 +313,7 @@ pub fn extra_dimension_lines(retail: &RetailDimensions, discount_bp: u32) -> Vec
         .unwrap_or(0);
     let price_width = rows
         .iter()
-        .map(|&(_, priced, _)| format_per_mtok_usd(priced).len())
+        .map(|&(_, priced, _)| format_usd(priced).len())
         .max()
         .unwrap_or(0);
     let mut lines: Vec<String> = rows
@@ -329,8 +321,8 @@ pub fn extra_dimension_lines(retail: &RetailDimensions, discount_bp: u32) -> Vec
         .map(|&(label, priced, received)| {
             format!(
                 "      {label:<label_width$}  {:>price_width$} → {}",
-                format_per_mtok_usd(priced),
-                format_per_mtok_usd(received),
+                format_usd(priced),
+                format_usd(received),
             )
         })
         .collect();
@@ -530,9 +522,9 @@ fn advice_lines(yours: &[&ProductCompetitiveness]) -> Vec<String> {
 mod tests {
     use super::{
         effective_dimensions, effective_per_mtok_ndollars, effective_rate_summary,
-        extra_dimension_count, extra_dimension_lines, format_discount_pct, format_per_mtok_usd,
-        format_usd, parse_discount_pct, rank_row, rank_rule, render_pricing, Network,
-        ProductCompetitiveness, MAX_DISCOUNT_BP, PRICE_DIMENSIONS, RANK_COLUMNS,
+        extra_dimension_count, extra_dimension_lines, format_discount_pct, format_usd,
+        parse_discount_pct, rank_row, rank_rule, render_pricing, Network, ProductCompetitiveness,
+        MAX_DISCOUNT_BP, PRICE_DIMENSIONS, RANK_COLUMNS,
     };
     use crate::types::RetailDimensions;
 
@@ -663,11 +655,39 @@ mod tests {
     }
 
     #[test]
-    fn format_usd_renders_three_decimals() {
+    fn format_usd_keeps_three_decimals_when_three_are_enough() {
         assert_eq!(format_usd(3_000_000_000), "$3.000");
         assert_eq!(format_usd(2_685_000_000), "$2.685");
         assert_eq!(format_usd(15_000_000), "$0.015");
         assert_eq!(format_usd(0), "$0.000");
+    }
+
+    #[test]
+    fn the_competitiveness_view_does_not_truncate_a_cheap_field() {
+        // The regression this guards: YOUR COST / BEST / MEDIAN went through a
+        // three-decimal formatter, so on a cheap model a real cost rendered
+        // "$0.000" — free — and two distinct rival costs rendered identically,
+        // in the one view whose whole job is deciding what to charge.
+        let rendered = render_pricing(
+            Network::Mainnet,
+            &products(serde_json::json!([{
+                "provider": "chutes", "model": "a-very-cheap-model",
+                "competitor_count": 3,
+                "best_cost_ndollars": 999_999_u64,
+                "median_cost_ndollars": 1_999_999_u64,
+                "offered_by_you": true,
+                "your_cost_ndollars": 1_999_998_u64,
+                "your_discount_bp": 500,
+                "your_rank": 2,
+            }])),
+        )
+        .join("\n");
+
+        assert!(rendered.contains("$0.000999999"), "{rendered}");
+        assert!(rendered.contains("$0.001999999"), "{rendered}");
+        assert!(rendered.contains("$0.001999998"), "{rendered}");
+        // Nothing in a priced column may read as free.
+        assert!(!rendered.contains("$0.000 "), "{rendered}");
     }
 
     #[test]
@@ -932,15 +952,13 @@ mod tests {
     fn a_unit_price_below_a_tenth_of_a_cent_keeps_its_digits() {
         // Three decimal places would render every one of these as "$0.000",
         // telling the miner a priced dimension pays nothing.
-        assert_eq!(format_per_mtok_usd(3_000_000_000), "$3.000");
-        assert_eq!(format_per_mtok_usd(1_000_000), "$0.001");
-        assert_eq!(format_per_mtok_usd(100_000), "$0.0001");
-        assert_eq!(format_per_mtok_usd(1_000), "$0.000001");
-        assert_eq!(format_per_mtok_usd(1), "$0.000000001");
+        assert_eq!(format_usd(3_000_000_000), "$3.000");
+        assert_eq!(format_usd(1_000_000), "$0.001");
+        assert_eq!(format_usd(100_000), "$0.0001");
+        assert_eq!(format_usd(1_000), "$0.000001");
+        assert_eq!(format_usd(1), "$0.000000001");
         // Zero is a real answer, not a rounding artefact, so it stays short.
-        assert_eq!(format_per_mtok_usd(0), "$0.000");
-        // The whole-request cost formatter keeps its three places.
-        assert_eq!(format_usd(999_999), "$0.000");
+        assert_eq!(format_usd(0), "$0.000");
     }
 
     #[test]
@@ -948,12 +966,12 @@ mod tests {
         // Just above each width a tiered formatter would have chosen. Every
         // one of these has significant digits below that width, and dropping
         // them shows the miner less than they are paid.
-        assert_eq!(format_per_mtok_usd(1_999_999), "$0.001999999");
-        assert_eq!(format_per_mtok_usd(1_999), "$0.000001999");
-        assert_eq!(format_per_mtok_usd(999_999), "$0.000999999");
-        assert_eq!(format_per_mtok_usd(999), "$0.000000999");
-        assert_eq!(format_per_mtok_usd(1_000_000_001), "$1.000000001");
-        assert_eq!(format_per_mtok_usd(3_356_250_000), "$3.35625");
+        assert_eq!(format_usd(1_999_999), "$0.001999999");
+        assert_eq!(format_usd(1_999), "$0.000001999");
+        assert_eq!(format_usd(999_999), "$0.000999999");
+        assert_eq!(format_usd(999), "$0.000000999");
+        assert_eq!(format_usd(1_000_000_001), "$1.000000001");
+        assert_eq!(format_usd(3_356_250_000), "$3.35625");
         // Every value round-trips: the rendered digits are the amount.
         for ndollars in [
             0_u64,
@@ -970,7 +988,7 @@ mod tests {
             15_000_000_000,
             u64::MAX,
         ] {
-            let rendered = format_per_mtok_usd(ndollars);
+            let rendered = format_usd(ndollars);
             let (dollars, fraction) = rendered
                 .trim_start_matches('$')
                 .split_once('.')

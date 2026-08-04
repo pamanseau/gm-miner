@@ -11,7 +11,7 @@ use gm_miner_cli::{
     dependency::confirm,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
-        format_per_mtok_usd,
+        format_usd,
     },
     types::{
         MinerStatus, Product, ProductCatalogResponse, ProductDeclarationRequest,
@@ -208,10 +208,10 @@ fn declaration_lines(
 ) -> Vec<String> {
     let width = retail_label.len().max("You receive".len()) + 2;
     let effective = effective_dimensions(retail, discount_bp);
-    let retail_in = format_per_mtok_usd(retail.input_per_mtok_ndollars);
-    let retail_out = format_per_mtok_usd(retail.output_per_mtok_ndollars);
-    let eff_in = format_per_mtok_usd(effective.input_per_mtok_ndollars);
-    let eff_out = format_per_mtok_usd(effective.output_per_mtok_ndollars);
+    let retail_in = format_usd(retail.input_per_mtok_ndollars);
+    let retail_out = format_usd(retail.output_per_mtok_ndollars);
+    let eff_in = format_usd(effective.input_per_mtok_ndollars);
+    let eff_out = format_usd(effective.output_per_mtok_ndollars);
     // What the miner keeps per token, as a percentage of retail. With
     // discount_bp = 0 this reads "100%"; at the 99.90% cap this is
     // "0.1% of retail" — the minimum positive payout.
@@ -346,8 +346,8 @@ fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> 
             "  {}/{}: {} in / {} out per Mtok",
             product.provider,
             product.model,
-            format_per_mtok_usd(effective.input_per_mtok_ndollars),
-            format_per_mtok_usd(effective.output_per_mtok_ndollars),
+            format_usd(effective.input_per_mtok_ndollars),
+            format_usd(effective.output_per_mtok_ndollars),
         ));
         lines.extend(extra_dimension_lines(dims, discount_bp));
     }
@@ -620,6 +620,20 @@ const STATUS_HEADERS: [&str; 6] = [
 /// example overflows and shunts `OFFERED`/`ELIGIBLE` off their headers — for
 /// exactly the small-price products this rendering exists to clarify. Sizing
 /// from the data cannot be outgrown.
+///
+/// Widths are counted in Unicode scalars, which is exactly what `{:<width$}`
+/// pads by, so header, rule and every row come out the same length no matter
+/// what the cells contain. That equals *terminal columns* only for characters
+/// one column wide. The assumption is that every cell here is ASCII, and each
+/// one is: the provider is a fixed enum, the discount and the yes/no cells are
+/// generated, the rate cell is digits and `$./` — and the model id is a
+/// provider's own API identifier, which has to survive being interpolated into
+/// the `/miners/products/{provider}/{model}` path. `product.json` puts no
+/// `pattern` on the model field, so this is a property of the catalog rather
+/// than a guarantee of the contract; a wide-glyph slug would misalign the
+/// columns after it and nothing worse. `unicode-width` is not worth a
+/// dependency for a cosmetic defect on a case that cannot currently arise —
+/// revisit if a non-ASCII slug ever reaches the catalog.
 fn status_table_lines(rows: &[[String; 6]]) -> Vec<String> {
     let mut widths = STATUS_HEADERS.map(str::len);
     for row in rows {
@@ -1171,6 +1185,16 @@ mod tests {
                 "the ELIGIBLE column is out of line:\n{rendered}"
             );
         }
+        // Byte-indexing the rendered line above is only sound because every
+        // cell is ASCII — see `status_table_lines`. This pins that assumption
+        // rather than leaving it implicit: a non-ASCII model id would make
+        // widths (Unicode scalars) diverge from terminal columns, and would
+        // also make `eligible_at` a byte offset into the middle of a
+        // character. It cannot arise from the catalog today.
+        assert!(
+            lines.iter().all(|line| line.is_ascii()),
+            "a non-ASCII cell reached the table:\n{rendered}"
+        );
     }
 
     #[test]
