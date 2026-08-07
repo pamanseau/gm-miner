@@ -389,11 +389,20 @@ static_resources:
                             cluster: openai
                             host_rewrite_literal: __GM_OPENAI_HOST__
                             ## gm:openai-path-rewrite-begin
+                            ##  Azure OpenAI serves its OpenAI-compatible
+                            ##  surface under /openai/v1, so the inbound
+                            ##  /v1/chat/completions and /v1/responses
+                            ##  paths (the latter the Responses API, which
+                            ##  the gateway forwards verbatim) are rewritten
+                            ##  to their /openai/v1 forms. Direct
+                            ##  api.openai.com serves both under /v1, so the
+                            ##  rewrite is dropped entirely for `direct` via
+                            ##  OPENAI_PATH_REWRITE.
                             regex_rewrite:
                               pattern:
                                 google_re2: {}
-                                regex: "^/v1/chat/completions$"
-                              substitution: "/openai/v1/chat/completions"
+                                regex: "^/v1/(chat/completions|responses)$"
+                              substitution: "/openai/v1/\\1"
                             ## gm:openai-path-rewrite-end
                             timeout: 1800s
                           request_headers_to_remove:

@@ -204,9 +204,58 @@ fn bedrock_and_azure_render_cloud_upstreams() {
     assert!(rendered.contains("filename: /etc/ssl/certs/ca-certificates.crt"));
     assert!(rendered.contains("suffix: .openai.azure.com"));
     assert!(!rendered.contains("exact: gm-resource.openai.azure.com"));
-    assert!(rendered.contains("substitution: \"/openai/v1/chat/completions\""));
+    assert!(rendered.contains("regex: \"^/v1/(chat/completions|responses)$\""));
+    assert!(rendered.contains("substitution: \"/openai/v1/\\\\1\""));
     assert!(rendered.contains("key: api-key"));
     assert!(rendered.contains("value: \"%ENVIRONMENT(AZURE_OPENAI_API_KEY)%\""));
+}
+
+#[test]
+fn azure_openai_rewrites_both_chat_completions_and_responses() {
+    // Azure OpenAI serves its OpenAI-compatible surface under /openai/v1,
+    // so the path rewrite must map BOTH the chat-completions and the
+    // Responses-API inbound paths to their /openai/v1 forms. The gateway
+    // forwards POST /v1/responses to the miner verbatim (gm gateway,
+    // pipeline/openai_responses.rs), and an Azure miner that only rewrites
+    // chat/completions 404s every Responses request upstream.
+    let (status, _, stderr, rendered) = render_envoy([
+        ("OPENAI_UPSTREAM", "azure"),
+        (
+            "AZURE_OPENAI_ENDPOINT",
+            "https://gm-resource.openai.azure.com/",
+        ),
+        ("AZURE_OPENAI_API_KEY", "azure-key"),
+    ]);
+    assert!(status.success(), "render failed: {stderr}");
+    let route = rendered
+        .split_once("exact: \"openai\"")
+        .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        route.contains("regex: \"^/v1/(chat/completions|responses)$\""),
+        "rewrite must cover both OpenAI surfaces"
+    );
+    assert!(
+        route.contains("substitution: \"/openai/v1/\\\\1\""),
+        "rewrite must prepend /openai/v1 to the captured surface"
+    );
+}
+
+#[test]
+fn direct_openai_keeps_v1_responses_verbatim() {
+    // Direct api.openai.com serves the Responses API at /v1/responses
+    // itself, so the direct route must NOT carry the /openai/v1 rewrite —
+    // a copy of the Azure block would 404 every Responses request.
+    let (status, _, stderr, rendered) = render_envoy([("OPENAI_API_KEY", "sk-openai-direct")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let route = rendered
+        .split_once("exact: \"openai\"")
+        .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        !route.contains("regex_rewrite"),
+        "direct openai must not path-rewrite"
+    );
 }
 
 #[test]
