@@ -95,9 +95,17 @@ impl std::str::FromStr for Provider {
 /// show the miner the effective per-Mtok rate they'll receive after applying
 /// their declared discount. Other retail fields are intentionally
 /// ignored — the CLI doesn't bill, the gateway does.
+///
+/// `provider` is decoded as a `String`, not [`Provider`], so a product whose
+/// upstream this CLI build predates does not fail the decode of the whole
+/// catalog — the same forward-compatibility [`SourceProduct::provider`]
+/// already has. The registry's `GET /products` is catalog-wide, so a single
+/// unknown provider string would otherwise brick `status`/`declare-product`/
+/// `declare-products` on every deployed older CLI the day a new provider
+/// lands.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Product {
-    pub provider: Provider,
+    pub provider: String,
     pub model: String,
     pub status: String,
     pub retail_price: RetailPrice,

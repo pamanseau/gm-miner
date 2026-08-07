@@ -176,9 +176,36 @@ fn product_catalog_response_parses_wrapper_shape() {
     });
     let parsed: ProductCatalogResponse = serde_json::from_value(body).unwrap();
     assert_eq!(parsed.products.len(), 3);
-    assert_eq!(parsed.products[0].provider, Provider::Anthropic);
+    assert_eq!(parsed.products[0].provider, "anthropic");
     assert_eq!(parsed.products[0].model, "claude-sonnet-4-6");
     assert_eq!(parsed.products[2].status, "deprecated");
+}
+
+#[test]
+fn product_catalog_parses_a_provider_this_build_predates() {
+    // The registry's GET /products is catalog-wide. A product whose upstream
+    // this CLI build predates must not fail the decode of every other product
+    // alongside it — status/declare all read the whole catalog. provider is
+    // decoded as a String for exactly this reason (mirrors SourceProduct).
+    let retail = serde_json::json!({
+        "dimensions": {
+            "input_per_mtok_ndollars": 3_000_000_000_u64,
+            "output_per_mtok_ndollars": 15_000_000_000_u64,
+        }
+    });
+    let body = serde_json::json!({
+        "products": [
+            {"provider": "brandnew", "model": "wonder-model-1", "status": "active",
+             "retail_price": retail},
+            {"provider": "anthropic", "model": "claude-sonnet-4-6", "status": "active",
+             "retail_price": retail},
+        ],
+        "generated_at": "2026-06-05T10:00:00Z",
+    });
+    let parsed: ProductCatalogResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(parsed.products.len(), 2);
+    assert_eq!(parsed.products[0].provider, "brandnew");
+    assert_eq!(parsed.products[0].model, "wonder-model-1");
 }
 
 #[test]

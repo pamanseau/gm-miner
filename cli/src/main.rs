@@ -1074,9 +1074,9 @@ mod tests {
         );
     }
 
-    fn p(provider: Provider, model: &str, status: &str) -> Product {
+    fn p(provider: &Provider, model: &str, status: &str) -> Product {
         Product {
-            provider,
+            provider: provider.as_str().to_owned(),
             model: model.to_owned(),
             status: status.to_owned(),
             retail_price: RetailPrice {
@@ -1830,9 +1830,9 @@ mod tests {
     #[test]
     fn filter_catalog_keeps_active_real_providers() {
         let products = [
-            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
-            p(Provider::OpenAI, "gpt-5.5", "active"),
-            p(Provider::Gemini, "gemini-2.5-pro", "active"),
+            p(&Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(&Provider::OpenAI, "gpt-5.5", "active"),
+            p(&Provider::Gemini, "gemini-2.5-pro", "active"),
         ];
         let kept = filter_catalog(&products, None);
         assert_eq!(kept.len(), 3);
@@ -1841,8 +1841,8 @@ mod tests {
     #[test]
     fn filter_catalog_drops_deprecated() {
         let products = [
-            p(Provider::Anthropic, "claude-old", "deprecated"),
-            p(Provider::OpenAI, "gpt-5.5", "active"),
+            p(&Provider::Anthropic, "claude-old", "deprecated"),
+            p(&Provider::OpenAI, "gpt-5.5", "active"),
         ];
         let kept = filter_catalog(&products, None);
         assert_eq!(kept.len(), 1);
@@ -1855,23 +1855,23 @@ mod tests {
         // against it 404. If a future registry change ever exposes a
         // benchmark row in GET /products, the fan-out must still skip it.
         let products = [
-            p(Provider::Benchmark, "gpt-bench", "active"),
-            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(&Provider::Benchmark, "gpt-bench", "active"),
+            p(&Provider::Anthropic, "claude-sonnet-4-6", "active"),
         ];
         let kept = filter_catalog(&products, None);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].provider, Provider::Anthropic);
+        assert_eq!(kept[0].provider, Provider::Anthropic.as_str());
     }
 
     #[test]
     fn filter_catalog_narrows_to_one_provider() {
         let products = [
-            p(Provider::Anthropic, "claude-sonnet-4-6", "active"),
-            p(Provider::OpenAI, "gpt-5.5", "active"),
+            p(&Provider::Anthropic, "claude-sonnet-4-6", "active"),
+            p(&Provider::OpenAI, "gpt-5.5", "active"),
         ];
         let kept = filter_catalog(&products, Some(&Provider::OpenAI));
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].provider, Provider::OpenAI);
+        assert_eq!(kept[0].provider, Provider::OpenAI.as_str());
     }
 
     #[test]

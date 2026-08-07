@@ -54,7 +54,7 @@ pub(crate) async fn cmd_declare_product(
     let catalog_hit = catalog
         .products
         .iter()
-        .find(|p| &p.provider == provider && p.model == model);
+        .find(|p| p.provider == provider.as_str() && p.model == model);
 
     let lines = if let Some(product) = catalog_hit {
         declaration_lines(
@@ -83,7 +83,14 @@ pub(crate) async fn cmd_declare_product(
         return Ok(());
     }
 
-    post_declare_product(client, provider, model, discount_bp, args.upstream_model).await?;
+    post_declare_product(
+        client,
+        provider.as_str(),
+        model,
+        discount_bp,
+        args.upstream_model,
+    )
+    .await?;
     println!("  → ok");
     println!("\nNext: gmcli status   (confirm the offer)");
     Ok(())
@@ -302,8 +309,14 @@ pub(crate) async fn cmd_declare_products(
     let mut ok_count = 0_usize;
     let mut err_count = 0_usize;
     for product in &targets {
-        match post_declare_product(client, &product.provider, &product.model, discount_bp, None)
-            .await
+        match post_declare_product(
+            client,
+            product.provider.as_str(),
+            &product.model,
+            discount_bp,
+            None,
+        )
+        .await
         {
             Ok(()) => {
                 println!("  {}/{}: ok", product.provider, product.model);
@@ -384,13 +397,13 @@ fn fan_out_preview_lines(targets: &[&Product], discount_bp: u32) -> Vec<String> 
 /// `declare-products` share the same wire-shape + error-detail logic.
 async fn post_declare_product(
     client: &mut RegistryClient,
-    provider: &Provider,
+    provider: &str,
     model: &str,
     discount_bp: u32,
     upstream_model: Option<&str>,
 ) -> Result<()> {
     let body = serde_json::to_value(ProductDeclarationRequest {
-        provider: provider.as_str(),
+        provider,
         model,
         discount_bp,
         upstream_model,
@@ -587,8 +600,8 @@ pub(crate) fn filter_catalog<'a>(
     products
         .iter()
         .filter(|p| p.status == "active")
-        .filter(|p| p.provider != Provider::Benchmark)
-        .filter(|p| provider_filter.is_none_or(|target| &p.provider == target))
+        .filter(|p| p.provider != "benchmark")
+        .filter(|p| provider_filter.is_none_or(|target| p.provider == target.as_str()))
         .collect()
 }
 
@@ -632,7 +645,7 @@ const STATUS_HEADERS: [&str; 6] = [
 ];
 
 /// The catalog retail vector for each product, keyed by (provider, model).
-type RetailByKey<'a> = std::collections::HashMap<(Provider, &'a str), &'a RetailDimensions>;
+type RetailByKey<'a> = std::collections::HashMap<(String, &'a str), &'a RetailDimensions>;
 
 /// Render the per-offer table joining `/miners/me` offers against the public
 /// catalog so each row shows the effective per-Mtok rate the miner receives.
@@ -679,19 +692,18 @@ fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -
     offers
         .iter()
         .map(|offer| {
-            let (discount_label, rate_label) =
-                match (offer.discount_bp, offer.provider.parse::<Provider>()) {
-                    (Some(bp), Ok(provider)) => (
-                        format!("{}%", format_discount_pct(bp)),
-                        retail_by_key
-                            .get(&(provider, offer.model.as_str()))
-                            .map_or_else(
-                                || "(retail unknown)".to_owned(),
-                                |dims| effective_rate_summary(dims, bp),
-                            ),
-                    ),
-                    _ => ("—".to_owned(), "—".to_owned()),
-                };
+            let (discount_label, rate_label) = match offer.discount_bp {
+                Some(bp) => (
+                    format!("{}%", format_discount_pct(bp)),
+                    retail_by_key
+                        .get(&(offer.provider.clone(), offer.model.as_str()))
+                        .map_or_else(
+                            || "(retail unknown)".to_owned(),
+                            |dims| effective_rate_summary(dims, bp),
+                        ),
+                ),
+                None => ("—".to_owned(), "—".to_owned()),
+            };
             vec![
                 offer.provider.clone(),
                 offer.model.clone(),
@@ -713,11 +725,10 @@ fn status_rows(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -
 fn extra_rate_lines(offers: &[ProductOfferStatus], retail_by_key: &RetailByKey<'_>) -> Vec<String> {
     let mut lines = Vec::new();
     for offer in offers {
-        let (Some(bp), Ok(provider)) = (offer.discount_bp, offer.provider.parse::<Provider>())
-        else {
+        let Some(bp) = offer.discount_bp else {
             continue;
         };
-        let Some(dims) = retail_by_key.get(&(provider, offer.model.as_str())) else {
+        let Some(dims) = retail_by_key.get(&(offer.provider.clone(), offer.model.as_str())) else {
             continue;
         };
         let extras = extra_dimension_lines(dims, bp);
@@ -1112,10 +1123,16 @@ mod tests {
         };
         let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
         retail_by_key.insert(
-            (Provider::Chutes, "a-very-cheap-model-with-a-long-id"),
+            (
+                Provider::Chutes.as_str().to_owned(),
+                "a-very-cheap-model-with-a-long-id",
+            ),
             &tiny,
         );
-        retail_by_key.insert((Provider::Anthropic, "claude-sonnet-4-6"), &plain);
+        retail_by_key.insert(
+            (Provider::Anthropic.as_str().to_owned(), "claude-sonnet-4-6"),
+            &plain,
+        );
 
         let rows = status_rows(
             &offers(serde_json::json!([
@@ -1183,8 +1200,11 @@ mod tests {
             ..Default::default()
         };
         let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
-        retail_by_key.insert((Provider::Anthropic, "claude-sonnet-4-6"), &dims_rich);
-        retail_by_key.insert((Provider::Zai, "glm-5.2"), &dims_plain);
+        retail_by_key.insert(
+            (Provider::Anthropic.as_str().to_owned(), "claude-sonnet-4-6"),
+            &dims_rich,
+        );
+        retail_by_key.insert((Provider::Zai.as_str().to_owned(), "glm-5.2"), &dims_plain);
 
         let rendered = extra_rate_lines(
             &offers(serde_json::json!([
@@ -1230,7 +1250,7 @@ mod tests {
             ..Default::default()
         };
         let mut retail_by_key: RetailByKey<'_> = std::collections::HashMap::new();
-        retail_by_key.insert((Provider::Zai, "glm-5.2"), &dims);
+        retail_by_key.insert((Provider::Zai.as_str().to_owned(), "glm-5.2"), &dims);
 
         assert!(extra_rate_lines(
             &offers(serde_json::json!([{
