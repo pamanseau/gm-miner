@@ -337,7 +337,7 @@ async fn fetch_canonical_models(
             if let Some(product) = catalog
                 .products
                 .iter()
-                .find(|product| &product.provider == provider && product.status == "active")
+                .find(|product| product.provider == provider.as_str() && product.status == "active")
             {
                 models.insert(provider.clone(), product.model.clone());
             }
