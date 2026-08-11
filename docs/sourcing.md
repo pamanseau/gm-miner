@@ -124,18 +124,35 @@ the miner advertises opaque slot ids for them — see
 gmcli deploy
 ```
 
-The registry probes each worker for the models it can actually reach. Until that
-probe succeeds, the route shows `YOU SERVE: no` and declaring it would only
-produce an ineligible offer.
-
 **3. Declare the route.** Use the **route** pair, not the buyer pair:
 
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 ```
 
-`gmcli sources` prints this line for you, pre-filled, for every route you can
-serve and have not declared yet.
+`gmcli sources` prints this line for you, pre-filled, for every undeclared route
+where declaring it would actually get you somewhere — one a worker already
+serves, or any route under a provider you have no live offer under. It stays
+quiet for a route whose provider is already declared and whose count is still
+zero, because a second offer there changes nothing about why no worker qualifies.
+
+**For a provider you have no offer under, declare before waiting for
+`YOU SERVE: yes`.** The registry builds its probe set from the providers you
+have offers for, so while a provider has no offer it is not probed and every one
+of its routes reads `YOU SERVE: no` however your workers are configured.
+Declaring one of them puts the provider into the probe set, which is what lets
+the count move for **all** of that provider's routes — the probe is per provider,
+not per route. It still has to reach the upstream before any count rises; a key
+the upstream rejects leaves them all at zero.
+
+Once the provider is probed, a `YOU SERVE: no` on one of its other routes is
+telling you about that route rather than about the probe set: no worker of yours
+currently qualifies for it. That is worth diagnosing (the causes are listed
+below, and several are transient) rather than answering with another declare.
+`gmcli sources` uses the same distinction to decide when to print the declare
+line, from the offers it can see — it knows whether a provider is offered now,
+not whether a probe has finished, so give a fresh declaration a cycle before
+reading anything into its count.
 
 Note that `declare-products` (the fan-out) is catalog-only on purpose and will not
 declare a route. A route offer commits you to an upstream you hold a key for, so
@@ -146,12 +163,19 @@ glm-5.2`. The registry keeps the row for audit and re-declaring re-offers it.
 
 ## Why a route shows `YOU SERVE: no`
 
-The count is how many of your workers hold a usable key for that upstream and are
-on an approved image today. Zero means declaring it buys you nothing yet. It is a
-capability count, not final admission: if one worker can serve two routes for the
-same buyer product, it is counted under both, and only one of them will be routed.
-In rough order of frequency:
+The count is how many of your workers are active, are on an approved image, and
+carry that route in the capability the registry last probed for them. It is
+evaluated when you ask, so revoking an image drops the count
+immediately. It is a capability count, not final admission: if one
+worker can serve two routes for the same buyer product, it is counted under both,
+and only one of them will be routed. In rough order of frequency:
 
+- **You have no live offer under that provider.** Not a fault: the registry
+  only probes providers you have offers for, so a provider with no offer reads
+  zero across all its routes no matter how the worker is configured. Declare any
+  one of them to put the provider in the probe set; the causes below then decide
+  whether the counts actually rise. This does **not** apply once the provider has
+  an offer — from then on work through the causes below instead.
 - The key is not set, or was set after your last deploy — run `gmcli set-api-keys`
   then `gmcli deploy`.
 - The worker has not been probed since it came up. Wait a cycle and re-check.

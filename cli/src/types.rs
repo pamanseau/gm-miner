@@ -196,8 +196,19 @@ pub struct SourceProduct {
     pub buyer_model: String,
     pub retail_price: RetailPrice,
     /// How many of the miner's active workers hold a key that answers for
-    /// (`provider`, `model`). Zero means the route is unservable until a key
-    /// is set and rolled out to a worker.
+    /// (`provider`, `model`).
+    ///
+    /// Evaluated live, not a record of the last probe: it counts the miner's
+    /// workers that are active, run a currently-approved image, and carry this
+    /// route in their stored capability set. Any of those three failing drops a
+    /// worker out, so a worker that served happily an hour ago counts zero the
+    /// moment its image is revoked.
+    ///
+    /// Zero therefore says only "none qualify right now" and is not evidence
+    /// about the key. It is not even evidence about the worker while the route's
+    /// provider has no live offer — the control loop probes only providers the
+    /// miner currently offers, so no probe is running to refresh the capability
+    /// entry this counts, whatever an earlier offer may once have written.
     pub capable_worker_count: u32,
     pub already_offered: bool,
 }
