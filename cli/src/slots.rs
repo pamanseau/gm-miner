@@ -12,7 +12,10 @@ use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 
+use strum::IntoEnumIterator as _;
+
 use crate::config::ProviderKeys;
+use crate::types::Provider;
 
 const MAX_PROVIDER_SLOTS: usize = 8;
 const SLOT_ID_LEN: usize = 12;
@@ -134,34 +137,16 @@ pub fn provider_slots_for_keys(
         return Ok(BTreeMap::new());
     }
 
+    // Walks `direct_key` rather than listing providers here: it already nulls a
+    // provider routed to a cloud backend, and `add_provider_slots` no-ops on a
+    // null value, so the two together reproduce the per-provider gating without
+    // a second copy of it that a new variant could be missed from.
     let mut slots = BTreeMap::new();
-    if keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct" {
-        add_provider_slots(
-            &mut slots,
-            "anthropic",
-            keys.anthropic.as_deref(),
-            node_secret,
-        )?;
+    for provider in Provider::iter() {
+        if let Some((_, value)) = keys.direct_key(&provider) {
+            add_provider_slots(&mut slots, provider.as_str(), value, node_secret)?;
+        }
     }
-    if keys.openai_upstream.as_deref().unwrap_or("direct") == "direct" {
-        add_provider_slots(&mut slots, "openai", keys.openai.as_deref(), node_secret)?;
-    }
-    add_provider_slots(&mut slots, "gemini", keys.google.as_deref(), node_secret)?;
-    add_provider_slots(&mut slots, "chutes", keys.chutes.as_deref(), node_secret)?;
-    add_provider_slots(&mut slots, "zai", keys.zai.as_deref(), node_secret)?;
-    add_provider_slots(
-        &mut slots,
-        "moonshot",
-        keys.moonshot.as_deref(),
-        node_secret,
-    )?;
-    add_provider_slots(
-        &mut slots,
-        "deepinfra",
-        keys.deepinfra.as_deref(),
-        node_secret,
-    )?;
-    add_provider_slots(&mut slots, "kubetee", keys.kubetee.as_deref(), node_secret)?;
     Ok(slots)
 }
 
@@ -247,26 +232,14 @@ pub fn reject_multikey_for_legacy_image(keys: &ProviderKeys) -> Result<()> {
 
 /// The direct-provider key env vars the deployed image would actually
 /// read: keys sidelined by a cloud upstream selector are excluded, so a
-/// stale semicolon value there never blocks a deploy.
-fn active_direct_keys(keys: &ProviderKeys) -> [(&'static str, Option<&str>); 8] {
-    let anthropic_direct = keys.anthropic_upstream.as_deref().unwrap_or("direct") == "direct";
-    let openai_direct = keys.openai_upstream.as_deref().unwrap_or("direct") == "direct";
-    [
-        (
-            "ANTHROPIC_API_KEY",
-            keys.anthropic.as_deref().filter(|_| anthropic_direct),
-        ),
-        (
-            "OPENAI_API_KEY",
-            keys.openai.as_deref().filter(|_| openai_direct),
-        ),
-        ("GOOGLE_API_KEY", keys.google.as_deref()),
-        ("CHUTES_API_KEY", keys.chutes.as_deref()),
-        ("ZAI_API_KEY", keys.zai.as_deref()),
-        ("MOONSHOT_API_KEY", keys.moonshot.as_deref()),
-        ("DEEPINFRA_API_KEY", keys.deepinfra.as_deref()),
-        ("KUBETEE_API_KEY", keys.kubetee.as_deref()),
-    ]
+/// stale semicolon value there never blocks a deploy. Delegates to
+/// [`ProviderKeys::direct_keys`], which walks every `Provider` variant
+/// through a compile-time-exhaustive match rather than a literal here that
+/// a new provider could silently miss.
+fn active_direct_keys(
+    keys: &ProviderKeys,
+) -> impl Iterator<Item = (&'static str, Option<&str>)> + '_ {
+    keys.direct_keys()
 }
 
 #[must_use]
