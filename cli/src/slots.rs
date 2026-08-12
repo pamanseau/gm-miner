@@ -438,6 +438,16 @@ mod tests {
     }
 
     #[test]
+    fn moonmath_direct_multikey_is_advertised() {
+        let keys = ProviderKeys {
+            moonmath: Some("mm-key-a;mm-key-b".to_owned()),
+            ..ProviderKeys::default()
+        };
+        let slots = provider_slots_for_keys(&keys, SECRET).expect("slots");
+        assert_eq!(slots["moonmath"].len(), 2);
+    }
+
+    #[test]
     fn cloud_backend_semicolon_is_fatal() {
         let keys = ProviderKeys {
             anthropic_upstream: Some("bedrock".to_owned()),

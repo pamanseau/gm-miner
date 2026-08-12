@@ -5,8 +5,8 @@ A **route** is how your worker fulfils it: which host it calls, with which key.
 
 One buyer product can have several routes, and none of them is the canonical one.
 `zai/glm-5.2` is the open GLM weights; Z.ai runs an API for them, and so do
-DeepInfra and Engy. The product id names the model, not the company you buy it
-from. Buyers see the product they asked for either way.
+DeepInfra, Engy, KubeTEE and Moonmath. The product id names the model, not the
+company you buy it from. Buyers see the product they asked for either way.
 
 Routes differ on more than price — latency, availability, region, context window,
 and data handling all vary between hosts serving identical weights. Price is
@@ -21,9 +21,13 @@ explains the table and how to set each upstream up.
 | Buyer product | Route | Upstream host | Key flag |
 |---|---|---|---|
 | `zai/glm-5.2` | `deepinfra/zai-org/GLM-5.2` | `api.deepinfra.com` | `--deepinfra` |
+| `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
+| `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
+| `zai/glm-5.2` | `moonmath/glm-5.2` | `zro.moonmath.ai` | `--moonmath` |
+| `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
 
 Both buyer products can also be served **direct** — with a Z.ai key (`--zai`) or a
 Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
@@ -112,6 +116,7 @@ never seen by gm:
 gmcli set-api-keys --deepinfra <key>
 gmcli set-api-keys --engy <key>
 gmcli set-api-keys --kubetee <key>
+gmcli set-api-keys --moonmath <key>
 ```
 
 Like the other upstream flags, each accepts up to 8 semicolon-separated keys and
@@ -128,6 +133,13 @@ gmcli deploy
 
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
+gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
+gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
+gmcli declare-product --provider deepinfra --model moonshotai/Kimi-K3 --discount-pct 5
+gmcli declare-product --provider kubetee --model z-ai/glm-5.2 --discount-pct 5
+gmcli declare-product --provider kubetee --model moonshotai/kimi-k3 --discount-pct 5
+gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
+gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 ```
 
 `gmcli sources` prints this line for you, pre-filled, for every undeclared route

@@ -60,11 +60,12 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// every supported provider key name plus the node secret, regardless of
 /// which keys an individual miner has configured. Hash covers names only,
 /// not values, so every miner produces the same `compose_hash`. The order
-/// matches `render_env_file`: Anthropic direct/Bedrock, `OpenAI` direct/Azure,
-/// Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, node secret.
+/// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
+/// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
+/// Moonmath, node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 28] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 29] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -92,6 +93,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 28] = [
     "DEEPINFRA_API_KEY",
     "KUBETEE_API_KEY",
     "ENGY_API_KEY",
+    "MOONMATH_API_KEY",
     "GM_NODE_SECRET",
 ];
 
@@ -213,18 +215,18 @@ mod tests {
 
     /// The testnet image ref whose `app_compose` hashes to the registry's
     /// approved baseline below — the gm-published public miner image for the
-    /// current supported release (v0.3.9). Must track the newest supported
+    /// current testnet-supported Moonmath candidate. Must track a supported
     /// image version: when a new `ImageVersion` is published, bump both this
     /// ref and `REGISTRY_TESTNET_COMPOSE_HASH` to the live registry row.
     const TESTNET_IMAGE_REF: &str =
-        "ghcr.io/taostat/gm-miner@sha256:e9dd652713cb09c29e0c04700ac8bf5a4384591c4b61a265a8385606d15a5181";
+        "ghcr.io/taostat/gm-miner@sha256:0930385fbe2bd733cb10425b08618756c0f09bd20b6a52a2dca95811853da10a";
 
     /// HARD ACCEPTANCE GATE. The canonical testnet `compose_hash` produced by
     /// `TESTNET_IMAGE_REF` + `CANONICAL_ALLOWED_ENVS` (the direct provider
     /// keys, cloud upstream settings, and node secret).
     ///
     const REGISTRY_TESTNET_COMPOSE_HASH: &str =
-        "8211ae97d50b4468a0a708d923133be9b7f705837947464cf90cb0a2fc7e6d73";
+        "803706d985bf0add871b3d42782d8f737a17e6c9b7ae02188144dcac065a167a";
 
     #[test]
     fn reproduces_registry_approved_testnet_compose_hash() {

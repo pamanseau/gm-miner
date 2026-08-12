@@ -111,6 +111,7 @@ pub fn render_env_file(
         ("DEEPINFRA_API_KEY", env_vars.deepinfra.as_deref()),
         ("KUBETEE_API_KEY", env_vars.kubetee.as_deref()),
         ("ENGY_API_KEY", env_vars.engy.as_deref()),
+        ("MOONMATH_API_KEY", env_vars.moonmath.as_deref()),
     ] {
         lines.push_str(name);
         lines.push('=');
@@ -418,6 +419,7 @@ mod tests {
                 "DEEPINFRA_API_KEY",
                 "KUBETEE_API_KEY",
                 "ENGY_API_KEY",
+                "MOONMATH_API_KEY",
                 "GM_NODE_SECRET",
             ],
             "the env file must declare every canonical name in CANONICAL_ALLOWED_ENVS order"

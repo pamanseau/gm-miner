@@ -388,10 +388,14 @@ if [[ -n "${ENGY_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "ENGY_API_KEY set"
 fi
+if [[ -n "${MOONMATH_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "MOONMATH_API_KEY set"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -426,6 +430,9 @@ fi
 if [[ -n "${ENGY_API_KEY:-}" ]]; then
   fan_out_slots engy ENGY_API_KEY
 fi
+if [[ -n "${MOONMATH_API_KEY:-}" ]]; then
+  fan_out_slots moonmath MOONMATH_API_KEY
+fi
 
 GM_ANTHROPIC_SLOT_MAP="$(lua_slot_map "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
 GM_ANTHROPIC_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ANTHROPIC_SLOT_IDS:-}" "GM_ANTHROPIC")"
@@ -445,6 +452,8 @@ GM_KUBETEE_SLOT_MAP="$(lua_slot_map "${GM_KUBETEE_SLOT_IDS:-}" "GM_KUBETEE")"
 GM_KUBETEE_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_KUBETEE_SLOT_IDS:-}" "GM_KUBETEE")"
 GM_ENGY_SLOT_MAP="$(lua_slot_map "${GM_ENGY_SLOT_IDS:-}" "GM_ENGY")"
 GM_ENGY_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_ENGY_SLOT_IDS:-}" "GM_ENGY")"
+GM_MOONMATH_SLOT_MAP="$(lua_slot_map "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
+GM_MOONMATH_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -565,6 +574,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_KUBETEE_DEFAULT_SLOT_ENV="${GM_KUBETEE_DEFAULT_SLOT_ENV}" \
   GM_ENGY_SLOT_MAP="${GM_ENGY_SLOT_MAP}" \
   GM_ENGY_DEFAULT_SLOT_ENV="${GM_ENGY_DEFAULT_SLOT_ENV}" \
+  GM_MOONMATH_SLOT_MAP="${GM_MOONMATH_SLOT_MAP}" \
+  GM_MOONMATH_DEFAULT_SLOT_ENV="${GM_MOONMATH_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
@@ -618,6 +629,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     kubetee_default_slot_env = ENVIRON["GM_KUBETEE_DEFAULT_SLOT_ENV"]
     engy_slot_map = ENVIRON["GM_ENGY_SLOT_MAP"]
     engy_default_slot_env = ENVIRON["GM_ENGY_DEFAULT_SLOT_ENV"]
+    moonmath_slot_map = ENVIRON["GM_MOONMATH_SLOT_MAP"]
+    moonmath_default_slot_env = ENVIRON["GM_MOONMATH_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
@@ -678,6 +691,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_KUBETEE_DEFAULT_SLOT_ENV__", kubetee_default_slot_env)
     line = subst(line, "__GM_ENGY_SLOT_MAP__", engy_slot_map)
     line = subst(line, "__GM_ENGY_DEFAULT_SLOT_ENV__", engy_default_slot_env)
+    line = subst(line, "__GM_MOONMATH_SLOT_MAP__", moonmath_slot_map)
+    line = subst(line, "__GM_MOONMATH_DEFAULT_SLOT_ENV__", moonmath_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     print line
