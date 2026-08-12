@@ -60,11 +60,12 @@ const FEATURES: [&str; 2] = ["kms", "tproxy-net"];
 /// every supported provider key name plus the node secret, regardless of
 /// which keys an individual miner has configured. Hash covers names only,
 /// not values, so every miner produces the same `compose_hash`. The order
-/// matches `render_env_file`: Anthropic direct/Bedrock, `OpenAI` direct/Azure,
-/// Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, node secret.
+/// matches `render_env_file`: Anthropic direct/Bedrock/Foundry, `OpenAI`
+/// direct/Azure, Google, Chutes, Z.ai, Moonshot, `DeepInfra`, `KubeTEE`, Engy,
+/// Moonmath, node secret.
 /// Private-registry pull credentials (`DSTACK_DOCKER_*`) are excluded: the
 /// gm image is public and those vars do not appear in `allowed_envs`.
-const CANONICAL_ALLOWED_ENVS: [&str; 28] = [
+const CANONICAL_ALLOWED_ENVS: [&str; 29] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_UPSTREAM",
     "BEDROCK_REGION",
@@ -92,6 +93,7 @@ const CANONICAL_ALLOWED_ENVS: [&str; 28] = [
     "DEEPINFRA_API_KEY",
     "KUBETEE_API_KEY",
     "ENGY_API_KEY",
+    "MOONMATH_API_KEY",
     "GM_NODE_SECRET",
 ];
 

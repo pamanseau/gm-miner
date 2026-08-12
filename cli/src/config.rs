@@ -344,6 +344,8 @@ pub struct ProviderKeys {
     pub kubetee: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moonmath: Option<String>,
 }
 
 /// True when `v` holds a non-empty, non-whitespace value. `Some("")` and
@@ -501,6 +503,7 @@ impl ProviderKeys {
             Provider::DeepInfra => Some(("DEEPINFRA_API_KEY", self.deepinfra.as_deref())),
             Provider::Kubetee => Some(("KUBETEE_API_KEY", self.kubetee.as_deref())),
             Provider::Engy => Some(("ENGY_API_KEY", self.engy.as_deref())),
+            Provider::Moonmath => Some(("MOONMATH_API_KEY", self.moonmath.as_deref())),
             Provider::Benchmark => None,
         }
     }
@@ -1034,12 +1037,17 @@ mod tests {
             deepinfra: Some("dif".to_owned()),
             kubetee: Some("kube".to_owned()),
             engy: Some("eng".to_owned()),
+            moonmath: Some("moon".to_owned()),
             ..ProviderKeys::default()
         };
 
         assert_eq!(
             keys.direct_key(&Provider::Engy),
             Some(("ENGY_API_KEY", Some("eng")))
+        );
+        assert_eq!(
+            keys.direct_key(&Provider::Moonmath),
+            Some(("MOONMATH_API_KEY", Some("moon")))
         );
         assert_eq!(keys.direct_key(&Provider::Benchmark), None);
 
@@ -1058,6 +1066,7 @@ mod tests {
                 "DEEPINFRA_API_KEY",
                 "KUBETEE_API_KEY",
                 "ENGY_API_KEY",
+                "MOONMATH_API_KEY",
             ]
         );
     }

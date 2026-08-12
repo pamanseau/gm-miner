@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "036179fdc95cff4c14b1b8f20486526a39acc96a7da0678ce1214a5763fe993b";
+    "6f56cc62543e3835ade280912cd29ac3c140724d5be0b8b4350e8e8fea3974eb";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -125,6 +125,30 @@ fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
     assert!(
         !route.contains("regex_rewrite"),
         "kubetee already serves /v1; a path rewrite would 404 every request"
+    );
+}
+
+#[test]
+fn moonmath_route_keeps_v1_path_uses_bearer_slots_and_pins_tls() {
+    let (status, _, stderr, rendered) = render_envoy([("MOONMATH_API_KEY", "mm-a;mm-b")]);
+    assert!(status.success(), "render failed: {stderr}");
+    assert!(rendered.contains("exact: zro.moonmath.ai"));
+    assert!(rendered.contains("GM_MOONMATH_KEY_SLOT_1"));
+    assert!(rendered.contains("GM_MOONMATH_KEY_SLOT_2"));
+    assert!(!rendered.contains("mm-a"));
+    assert!(!rendered.contains("mm-b"));
+
+    let route = rendered
+        .split_once("exact: \"moonmath\"")
+        .and_then(|(_, rest)| rest.split_once("request_headers_to_remove"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        !route.contains("regex_rewrite"),
+        "ZRO already serves /v1; a path rewrite would break the request"
+    );
+    assert!(
+        rendered.contains("elseif provider == \"moonmath\" then\n                              headers:add(\"authorization\", \"Bearer \" .. key)"),
+        "Moonmath authentication must use the published Bearer scheme"
     );
 }
 

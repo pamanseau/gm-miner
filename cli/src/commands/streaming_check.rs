@@ -261,6 +261,9 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     if non_empty(keys.engy.as_deref()) {
         providers.push(Provider::Engy);
     }
+    if non_empty(keys.moonmath.as_deref()) {
+        providers.push(Provider::Moonmath);
+    }
     Ok(providers)
 }
 
@@ -379,8 +382,8 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::OpenAI => "gpt-5.5",
         Provider::Gemini => "gemini-2.5-pro",
         Provider::Chutes => "deepseek-ai/DeepSeek-V3-0324",
-        // Engy serves the same open GLM weights under the same model id.
-        Provider::Zai | Provider::Engy => "glm-5.2",
+        // Engy and Moonmath serve the same open GLM weights under this model id.
+        Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
         Provider::Kubetee => "moonshotai/kimi-k3",
@@ -411,6 +414,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         | Provider::DeepInfra
         | Provider::Kubetee
         | Provider::Engy
+        | Provider::Moonmath
         | Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
     }
 }
@@ -788,6 +792,18 @@ mod tests {
             Value::String("zai-org/GLM-5.2".to_owned())
         );
         assert_eq!(probe.model, "zai-org/GLM-5.2");
+    }
+
+    #[test]
+    fn moonmath_probe_uses_openai_compatible_route_and_model() {
+        let model = ProbeModel {
+            canonical: fallback_model(&Provider::Moonmath).to_owned(),
+            upstream: None,
+        };
+        let probe = build_probe(Provider::Moonmath, &model);
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
+        assert_eq!(probe.model, "glm-5.2");
     }
 
     #[test]

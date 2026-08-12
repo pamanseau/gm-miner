@@ -351,6 +351,15 @@ fn any_set_true_when_engy_set() {
 }
 
 #[test]
+fn any_set_true_when_moonmath_set() {
+    let keys = ProviderKeys {
+        moonmath: Some("k".to_owned()),
+        ..ProviderKeys::default()
+    };
+    assert!(keys.any_set());
+}
+
+#[test]
 fn any_set_true_when_bedrock_selected_and_key_set() {
     let keys = ProviderKeys {
         anthropic_upstream: Some("bedrock".to_owned()),

@@ -408,6 +408,7 @@ fn wizard_provider_keys(
         && keys.deepinfra.is_none()
         && keys.kubetee.is_none()
         && keys.engy.is_none()
+        && keys.moonmath.is_none()
     {
         println!("  No keys entered — skipping. Set them later with `gmcli set-api-keys`.");
         return Ok(StepOutcome::Outstanding("gmcli set-api-keys".to_owned()));
@@ -451,6 +452,7 @@ fn wizard_provider_keys(
             keys.deepinfra,
             keys.kubetee,
             keys.engy,
+            keys.moonmath,
         )
     )
 }
@@ -485,6 +487,7 @@ fn prompt_provider_keys(assume_yes: bool) -> Result<ProviderKeys> {
         deepinfra: prompt_line("DeepInfra API key (blank to skip):", assume_yes)?,
         kubetee: prompt_line("KubeTEE API key (blank to skip):", assume_yes)?,
         engy: prompt_line("Engy API key (blank to skip):", assume_yes)?,
+        moonmath: prompt_line("Moonmath ZRO API key (blank to skip):", assume_yes)?,
     })
 }
 
@@ -530,6 +533,9 @@ fn describe_keys_command(keys: &ProviderKeys) -> String {
     }
     if keys.engy.is_some() {
         cmd.push_str(" --engy <key>");
+    }
+    if keys.moonmath.is_some() {
+        cmd.push_str(" --moonmath <key>");
     }
     cmd
 }

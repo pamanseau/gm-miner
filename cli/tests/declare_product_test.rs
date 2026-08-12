@@ -154,6 +154,13 @@ fn provider_from_str_accepts_kubetee() {
 }
 
 #[test]
+fn provider_from_str_accepts_moonmath() {
+    let provider = Provider::from_str("moonmath").unwrap();
+    assert_eq!(provider, Provider::Moonmath);
+    assert_eq!(provider.as_str(), "moonmath");
+}
+
+#[test]
 fn product_catalog_response_parses_wrapper_shape() {
     // GET /products returns ProductCatalogResponse, NOT a bare array —
     // matches the new OpenAPI schema (registry/openapi.json post-PR-C).
