@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "66c9535160d44c61130741aa6458c8f5c9a66775c801f2b4e74be689e185705c";
+    "b494e9bd4b6c4a2275e6776fc4d76fc9d91c90a607024611a9cc5dcbf171a2ec";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -103,9 +103,9 @@ fn engy_route_keeps_v1_path_and_pins_the_wildcard_san() {
 #[test]
 fn kubetee_route_keeps_v1_path_and_forces_http1() {
     // llm.kubetee.ai serves /v1 itself (no DeepInfra-style rewrite) but the
-    // public hop is Traefik TCP passthrough into a TEE guest that terminates
-    // Let’s Encrypt with uvicorn — no ALPN `h2`. The cluster must force
-    // HTTP/1.1 like DeepInfra; HTTP/2 yields `protocol error` / 502.
+    // public TLS endpoint does not negotiate ALPN `h2`. The cluster must force
+    // HTTP/1.1 like DeepInfra; HTTP/2 yields `protocol error` / 502. This is
+    // transport compatibility, not upstream TEE attestation validation.
     let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
     assert!(status.success(), "render failed: {stderr}");
     let cluster = rendered
