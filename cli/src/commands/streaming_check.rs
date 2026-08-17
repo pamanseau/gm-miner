@@ -386,7 +386,9 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
-        Provider::Kubetee => "moonshotai/kimi-k3",
+        // KubeTEE routes are not buyer-catalog products, so check-streaming
+        // always uses this fallback. Prefer the live GLM offer over kimi-k3.
+        Provider::Kubetee => "z-ai/glm-5.2",
         Provider::Benchmark => "benchmark",
     }
 }
@@ -774,9 +776,9 @@ mod tests {
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(
             probe.body["model"],
-            Value::String("moonshotai/kimi-k3".to_owned())
+            Value::String("z-ai/glm-5.2".to_owned())
         );
-        assert_eq!(probe.model, "moonshotai/kimi-k3");
+        assert_eq!(probe.model, "z-ai/glm-5.2");
     }
 
     #[test]
