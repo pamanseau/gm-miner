@@ -67,7 +67,8 @@ fn direct_unset_render_matches_pinned_output() {
 #[test]
 fn engy_route_keeps_v1_path_and_pins_the_wildcard_san() {
     // api.engy.ai serves the OpenAI-compatible surface under /v1 itself and
-    // negotiates h2 over ALPN, so it mirrors kubetee rather than deepinfra.
+    // negotiates h2 over ALPN (unlike kubetee, which forces HTTP/1.1 because
+    // llm.kubetee.ai has no ALPN h2 under Traefik TLS passthrough + uvicorn).
     // Its certificate carries only the wildcard `*.engy.ai`; Envoy's exact DNS
     // SAN matcher resolves that per RFC 6125, as it already does for
     // llm.kubetee.ai, api.z.ai and api.moonshot.ai.
@@ -100,10 +101,11 @@ fn engy_route_keeps_v1_path_and_pins_the_wildcard_san() {
 }
 
 #[test]
-fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
-    // llm.kubetee.ai serves the OpenAI-compatible surface under /v1 itself
-    // and negotiates h2 over ALPN, so the route must NOT carry deepinfra's
-    // /v1/openai rewrite and the cluster must NOT force http/1.1.
+fn kubetee_route_keeps_v1_path_and_forces_http1() {
+    // llm.kubetee.ai serves /v1 itself (no DeepInfra-style rewrite) but the
+    // public hop is Traefik TCP passthrough into a TEE guest that terminates
+    // Let’s Encrypt with uvicorn — no ALPN `h2`. The cluster must force
+    // HTTP/1.1 like DeepInfra; HTTP/2 yields `protocol error` / 502.
     let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
     assert!(status.success(), "render failed: {stderr}");
     let cluster = rendered
@@ -111,8 +113,12 @@ fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
         .and_then(|(_, rest)| rest.split_once("\n    - name:"))
         .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
     assert!(
-        cluster.contains("http2_protocol_options: {}"),
-        "kubetee upstream negotiates h2"
+        cluster.contains("http_protocol_options: {}"),
+        "kubetee upstream must force HTTP/1.1 (no ALPN h2 on llm.kubetee.ai)"
+    );
+    assert!(
+        !cluster.contains("http2_protocol_options: {}"),
+        "kubetee must not force HTTP/2"
     );
     assert!(
         cluster.contains("exact: llm.kubetee.ai"),

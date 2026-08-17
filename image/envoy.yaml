@@ -541,6 +541,7 @@ static_resources:
                         ##  Enabled only when KUBETEE_API_KEY is set.
                         ##  llm.kubetee.ai serves the OpenAI-compatible surface
                         ##  under /v1 itself, so no path rewrite is needed.
+                        ##  Upstream cluster uses HTTP/1.1 (see cluster comment).
                         - match:
                             prefix: "/"
                             headers:
@@ -1283,6 +1284,12 @@ static_resources:
                     exact: api.deepinfra.com
 
     ## ── KubeTEE ───────────────────────────────────────────────────────
+    ##  HTTP/1.1 on purpose (same shape as DeepInfra). llm.kubetee.ai is
+    ##  Traefik TCP passthrough into a TEE guest that terminates Let’s
+    ##  Encrypt with uvicorn — no ALPN `h2`. Forcing HTTP/2 here yields
+    ##  `upstream connect error … reset reason: protocol error` (502) and
+    ##  fails capability / streaming probes. Do not flip back to
+    ##  `http2_protocol_options` without guest-side ALPN h2.
     - name: kubetee
       type: LOGICAL_DNS
       connect_timeout: 10s
@@ -1291,7 +1298,7 @@ static_resources:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options: {}
+            http_protocol_options: {}
       load_assignment:
         cluster_name: kubetee
         endpoints:
