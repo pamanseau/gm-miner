@@ -54,8 +54,19 @@ struct ProviderProbe {
     /// Canonical gm model id, shown in output. The request body carries the
     /// upstream deployment id when the offer declared one (see [`ProbeModel`]).
     model: String,
+    fallback: bool,
     path: &'static str,
     body: Value,
+}
+
+impl ProviderProbe {
+    fn model_label(&self) -> String {
+        if self.fallback {
+            format!("{} [fallback]", self.model)
+        } else {
+            self.model.clone()
+        }
+    }
 }
 
 /// The two model ids a probe needs: the canonical gm id for display and the
@@ -70,6 +81,7 @@ struct ProviderProbe {
 struct ProbeModel {
     canonical: String,
     upstream: Option<String>,
+    fallback: bool,
 }
 
 impl ProbeModel {
@@ -91,7 +103,8 @@ struct ProbeTiming {
 ///
 /// Discovers the worker endpoint from the registry and the matching node secret
 /// from local gmcli config, then sends one streaming probe per configured
-/// provider. Per-provider failures are reported inline and do not panic.
+/// provider and per offered `KubeTEE` sourcing route. Per-route failures are
+/// reported inline and do not panic.
 pub(crate) async fn cmd_check_streaming(cfg: Config) -> Result<()> {
     let target = resolve_primary_worker(&cfg).await?;
     run_streaming_checks(&cfg, &target).await;
@@ -114,18 +127,40 @@ pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node
 
 async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     let providers = match configured_providers(cfg.provider_keys.as_ref()) {
-        Ok(providers) if !providers.is_empty() => providers,
-        Ok(_) => {
-            println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
-            return;
-        }
+        Ok(providers) => providers,
         Err(err) => {
             println!("  [!!] provider config invalid: {err}");
             return;
         }
     };
 
-    let model_catalog = fetch_probe_models(cfg, &providers).await;
+    let declared = fetch_declared_offers(cfg).await;
+    if let Some(declared) = declared.as_ref() {
+        for provider in offered_providers_missing_local(declared, &providers) {
+            println!(
+                "  [--] {provider}: registry has offered routes but no local key is configured; supply was not probed"
+            );
+        }
+    }
+
+    if providers.is_empty() {
+        println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
+        return;
+    }
+
+    if declared.is_none() && providers.contains(&Provider::Kubetee) {
+        println!(
+            "  [--] kubetee: could not read declared offers; probing fallback only (offered-route coverage unknown)"
+        );
+    }
+
+    let empty_declared = std::collections::HashMap::new();
+    let model_catalog = fetch_probe_models(
+        cfg,
+        &providers,
+        declared.as_ref().unwrap_or(&empty_declared),
+    )
+    .await;
     for provider in providers {
         for model in model_catalog.models_for(&provider) {
             let probe = build_probe(provider.clone(), &model);
@@ -233,6 +268,7 @@ fn configured_providers(keys: Option<&ProviderKeys>) -> Result<Vec<Provider>> {
     let anthropic_upstream = keys.anthropic_upstream.as_deref().unwrap_or("direct");
     if (anthropic_upstream == "direct" && non_empty(keys.anthropic.as_deref()))
         || (anthropic_upstream == "bedrock" && non_empty(keys.bedrock_api_key.as_deref()))
+        || (anthropic_upstream == "foundry" && non_empty(keys.azure_foundry_api_key.as_deref()))
     {
         providers.push(Provider::Anthropic);
     }
@@ -287,6 +323,7 @@ impl ProbeModels {
             _ => vec![ProbeModel {
                 canonical: fallback_model(provider).to_owned(),
                 upstream: None,
+                fallback: true,
             }],
         }
     }
@@ -301,11 +338,14 @@ impl ProbeModels {
 /// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
 /// nothing is declared, [`fallback_model`] is used at print time. The check
 /// must never fail the deploy it advises on.
-async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels {
+async fn fetch_probe_models(
+    cfg: &Config,
+    providers: &[Provider],
+    declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
+) -> ProbeModels {
     let canonical = fetch_canonical_models(cfg, providers).await;
-    let declared = fetch_declared_offers(cfg).await;
 
-    resolve_probe_models(providers, &canonical, &declared)
+    resolve_probe_models(providers, &canonical, declared)
 }
 
 fn resolve_probe_models(
@@ -335,6 +375,7 @@ fn resolve_probe_models(
                 vec![ProbeModel {
                     canonical,
                     upstream,
+                    fallback: false,
                 }],
             );
         }
@@ -382,29 +423,43 @@ struct DeclaredOffer {
 /// Authenticated `GET /miners/me` → declared offers keyed by `(provider, model)`.
 async fn fetch_declared_offers(
     cfg: &Config,
-) -> std::collections::HashMap<(Provider, String), DeclaredOffer> {
+) -> Option<std::collections::HashMap<(Provider, String), DeclaredOffer>> {
     let mut client = RegistryClient::new(cfg.clone());
-    let status = match client.get(ME_PATH).await {
-        Ok(resp) if resp.status().is_success() => resp.json::<MinerStatus>().await.ok(),
-        _ => None,
-    };
+    let resp = client.get(ME_PATH).await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let status = resp.json::<MinerStatus>().await.ok()?;
 
     let mut offers = std::collections::HashMap::new();
-    if let Some(status) = status {
-        for offer in status.products {
-            let Ok(provider) = offer.provider.parse::<Provider>() else {
-                continue;
-            };
-            offers.insert(
-                (provider, offer.model),
-                DeclaredOffer {
-                    upstream_model: offer.upstream_model,
-                    is_offered: offer.is_offered,
-                },
-            );
-        }
+    for offer in status.products {
+        let Ok(provider) = offer.provider.parse::<Provider>() else {
+            continue;
+        };
+        offers.insert(
+            (provider, offer.model),
+            DeclaredOffer {
+                upstream_model: offer.upstream_model,
+                is_offered: offer.is_offered,
+            },
+        );
     }
-    offers
+    Some(offers)
+}
+
+fn offered_providers_missing_local(
+    declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
+    configured: &[Provider],
+) -> Vec<Provider> {
+    let mut providers: Vec<_> = declared
+        .iter()
+        .filter(|(_, offer)| offer.is_offered)
+        .map(|((provider, _), _)| provider.clone())
+        .filter(|provider| !configured.contains(provider))
+        .collect();
+    providers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    providers.dedup();
+    providers
 }
 
 /// Every currently offered model for `provider`, sorted by model id for stable
@@ -424,6 +479,7 @@ fn declared_models_for_provider(
         .map(|(canonical, offer)| ProbeModel {
             canonical,
             upstream: offer.upstream_model,
+            fallback: false,
         })
         .collect()
 }
@@ -450,6 +506,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         Provider::Anthropic => ProviderProbe {
             provider,
             model: model.canonical.clone(),
+            fallback: model.fallback,
             path: "/v1/messages",
             body: serde_json::json!({
                 "model": model.wire_model(),
@@ -481,6 +538,7 @@ fn openai_compatible_probe(
     ProviderProbe {
         provider,
         model: model.canonical.clone(),
+        fallback: model.fallback,
         path,
         body: serde_json::json!({
             "model": model.wire_model(),
@@ -696,19 +754,18 @@ fn distinct_arrival_buckets(offsets: &[Duration]) -> usize {
 
 fn print_probe_result(probe: &ProviderProbe, result: Result<Vec<Duration>>) {
     let provider = probe.provider.as_str();
+    let model = probe.model_label();
     match result {
         Ok(offsets) => match classify_streaming(&offsets) {
             StreamingVerdict::Streaming => {
                 println!(
-                    "  [ok] {provider}/{}: streaming ({})",
-                    probe.model,
+                    "  [ok] {provider}/{model}: streaming ({})",
                     timing_summary(&offsets)
                 );
             }
             StreamingVerdict::Buffered => {
                 println!(
-                    "  [!!] {provider}/{}: WARNING buffered ({})",
-                    probe.model,
+                    "  [!!] {provider}/{model}: WARNING buffered ({})",
                     timing_summary(&offsets)
                 );
                 println!(
@@ -721,16 +778,14 @@ fn print_probe_result(probe: &ProviderProbe, result: Result<Vec<Duration>>) {
             }
             StreamingVerdict::Inconclusive => {
                 println!(
-                    "  [--] {provider}/{}: could not classify streaming behavior ({})",
-                    probe.model,
+                    "  [--] {provider}/{model}: could not classify streaming behavior ({})",
                     timing_summary(&offsets)
                 );
             }
         },
         Err(err) => {
             println!(
-                "  [!!] {provider}/{}: check failed: {err}\n       Confirm the worker is reachable, this provider is configured on the deployed CVM, and the probe model/deployment exists.",
-                probe.model
+                "  [!!] {provider}/{model}: check failed: {err}\n       Confirm the worker is reachable, this provider is configured on the deployed CVM, and the probe model/deployment exists."
             );
         }
     }
@@ -786,6 +841,7 @@ mod tests {
         let model = ProbeModel {
             canonical: "claude-sonnet-4-6".to_owned(),
             upstream: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
+            fallback: false,
         };
         let probe = build_probe(Provider::Anthropic, &model);
         assert_eq!(
@@ -800,6 +856,7 @@ mod tests {
         let model = ProbeModel {
             canonical: "gpt-5.5".to_owned(),
             upstream: None,
+            fallback: false,
         };
         let probe = build_probe(Provider::OpenAI, &model);
         assert_eq!(probe.body["model"], Value::String("gpt-5.5".to_owned()));
@@ -811,6 +868,7 @@ mod tests {
         let model = ProbeModel {
             canonical: fallback_model(&Provider::Zai).to_owned(),
             upstream: None,
+            fallback: true,
         };
         let probe = build_probe(Provider::Zai, &model);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -823,6 +881,7 @@ mod tests {
         let model = ProbeModel {
             canonical: fallback_model(&Provider::Kubetee).to_owned(),
             upstream: None,
+            fallback: true,
         };
         let probe = build_probe(Provider::Kubetee, &model);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -885,6 +944,9 @@ mod tests {
         let models = catalog.models_for(&Provider::Kubetee);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].canonical, "z-ai/glm-5.2");
+        assert!(models[0].fallback);
+        let probe = build_probe(Provider::Kubetee, &models[0]);
+        assert_eq!(probe.model_label(), "z-ai/glm-5.2 [fallback]");
     }
 
     #[test]
@@ -911,32 +973,9 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_kubetee_catalog_miss_fans_out_offered_routes() {
-        let mut declared = std::collections::HashMap::new();
-        for model in ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"] {
-            declared.insert(
-                (Provider::Kubetee, model.to_owned()),
-                DeclaredOffer {
-                    upstream_model: None,
-                    is_offered: true,
-                },
-            );
-        }
-        let canonical = std::collections::HashMap::new();
-
-        let catalog = resolve_probe_models(&[Provider::Kubetee], &canonical, &declared);
-        let models = catalog.models_for(&Provider::Kubetee);
-        let ids: Vec<_> = models
-            .iter()
-            .map(|model| model.canonical.as_str())
-            .collect();
-        assert_eq!(ids, vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
-    }
-
-    #[test]
     fn catalog_outage_does_not_fan_out_non_kubetee_routes() {
         let mut declared = std::collections::HashMap::new();
-        for model in ["gpt-5.5", "gpt-5.5-mini"] {
+        for model in ["o5", "o5-mini"] {
             declared.insert(
                 (Provider::OpenAI, model.to_owned()),
                 DeclaredOffer {
@@ -950,6 +989,58 @@ mod tests {
         let models = catalog.models_for(&Provider::OpenAI);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].canonical, "gpt-5.5");
+        assert!(models[0].fallback);
+    }
+
+    #[test]
+    fn offered_provider_without_a_local_key_is_reported_once() {
+        let mut declared = std::collections::HashMap::new();
+        for model in ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"] {
+            declared.insert(
+                (Provider::Kubetee, model.to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            );
+        }
+        declared.insert(
+            (Provider::OpenAI, "gpt-5.5".to_owned()),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: true,
+            },
+        );
+        declared.insert(
+            (Provider::Moonshot, "moonshotai/kimi-k3".to_owned()),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: false,
+            },
+        );
+
+        let missing = offered_providers_missing_local(&declared, &[Provider::OpenAI]);
+        assert_eq!(missing, vec![Provider::Kubetee]);
+    }
+
+    #[test]
+    fn foundry_anthropic_is_a_configured_provider() {
+        let keys = ProviderKeys {
+            anthropic_upstream: Some("foundry".to_owned()),
+            azure_foundry_endpoint: Some("https://example.services.ai.azure.com".to_owned()),
+            azure_foundry_api_key: Some("foundry-key".to_owned()),
+            azure_foundry_tenant_id: Some("tenant".to_owned()),
+            azure_foundry_subscription_id: Some("subscription".to_owned()),
+            azure_foundry_resource_group: Some("resource-group".to_owned()),
+            azure_foundry_client_id: Some("client".to_owned()),
+            azure_foundry_client_secret: Some("client-secret".to_owned()),
+            ..ProviderKeys::default()
+        };
+
+        assert_eq!(
+            configured_providers(Some(&keys)).expect("valid Foundry configuration"),
+            [Provider::Anthropic]
+        );
     }
 
     #[test]
@@ -981,6 +1072,7 @@ mod tests {
         let model = ProbeModel {
             canonical: fallback_model(&Provider::DeepInfra).to_owned(),
             upstream: None,
+            fallback: true,
         };
         let probe = build_probe(Provider::DeepInfra, &model);
         assert_eq!(probe.path, "/v1/chat/completions");
@@ -996,6 +1088,7 @@ mod tests {
         let model = ProbeModel {
             canonical: fallback_model(&Provider::Moonmath).to_owned(),
             upstream: None,
+            fallback: true,
         };
         let probe = build_probe(Provider::Moonmath, &model);
         assert_eq!(probe.path, "/v1/chat/completions");

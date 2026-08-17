@@ -336,7 +336,7 @@ gmcli worker remove <worker_id>
 | `gmcli sources` | List the [sourcing routes](docs/sourcing.md) you can serve — a buyer product served from a cheaper upstream |
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
-| `gmcli check-streaming` | Send one tiny streaming request per configured provider through your own data plane; reports whether tokens stream or buffer |
+| `gmcli check-streaming` | Probe streaming through your own data plane: once per configured provider, and once per offered KubeTEE sourcing route |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
