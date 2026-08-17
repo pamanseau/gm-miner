@@ -66,6 +66,7 @@ struct ProviderProbe {
 /// id before forwarding to the miner CVM. This self-test bypasses the gateway,
 /// so it performs the same rewrite — otherwise the probe 404s on exactly the
 /// cloud setups the streaming check exists to warn about.
+#[derive(Clone)]
 struct ProbeModel {
     canonical: String,
     upstream: Option<String>,
@@ -126,10 +127,11 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
 
     let model_catalog = fetch_probe_models(cfg, &providers).await;
     for provider in providers {
-        let model = model_catalog.model_for(&provider);
-        let probe = build_probe(provider, &model);
-        let result = run_provider_probe(target, &probe).await;
-        print_probe_result(&probe, result);
+        for model in model_catalog.models_for(&provider) {
+            let probe = build_probe(provider.clone(), &model);
+            let result = run_provider_probe(target, &probe).await;
+            print_probe_result(&probe, result);
+        }
     }
 }
 
@@ -272,32 +274,33 @@ fn non_empty(value: Option<&str>) -> bool {
 }
 
 struct ProbeModels {
-    models: std::collections::HashMap<Provider, ProbeModel>,
+    /// One or more models to probe per provider. Sourcing providers (KubeTEE)
+    /// may declare several routes (e.g. `z-ai/glm-5.2` and
+    /// `deepseek/deepseek-v4-flash-0731`); each gets its own check.
+    models: std::collections::HashMap<Provider, Vec<ProbeModel>>,
 }
 
 impl ProbeModels {
-    fn model_for(&self, provider: &Provider) -> ProbeModel {
+    fn models_for(&self, provider: &Provider) -> Vec<ProbeModel> {
         match self.models.get(provider) {
-            Some(model) => ProbeModel {
-                canonical: model.canonical.clone(),
-                upstream: model.upstream.clone(),
-            },
-            None => ProbeModel {
+            Some(models) if !models.is_empty() => models.clone(),
+            _ => vec![ProbeModel {
                 canonical: fallback_model(provider).to_owned(),
                 upstream: None,
-            },
+            }],
         }
     }
 }
 
-/// Resolve the probe model per provider: a canonical gm model id from the
+/// Resolve the probe model(s) per provider: a canonical gm model id from the
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
 /// Sourcing-only providers (e.g. KubeTEE) never appear in the buyer catalog, so
-/// when the catalog has no row this falls back to an **offered** model from
-/// `/miners/me` (preferring `is_offered`), then [`fallback_model`]. The check
-/// must never fail the deploy it advises on.
+/// when the catalog has no row this probes every **offered** model from
+/// `/miners/me` (e.g. GLM-5.2 and deepseek-v4-flash-0731). If nothing is
+/// declared, [`fallback_model`] is used at print time. The check must never
+/// fail the deploy it advises on.
 async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels {
     let canonical = fetch_canonical_models(cfg, providers).await;
     let declared = fetch_declared_offers(cfg).await;
@@ -310,23 +313,19 @@ async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels
                 .and_then(|offer| offer.upstream_model.clone());
             models.insert(
                 provider.clone(),
-                ProbeModel {
+                vec![ProbeModel {
                     canonical,
                     upstream,
-                },
+                }],
             );
             continue;
         }
-        // Catalog miss (typical for sourcing routes): probe what this miner
-        // actually declared, not an unrelated hardcoded model.
-        if let Some((canonical, upstream)) = first_declared_model(&declared, provider) {
-            models.insert(
-                provider.clone(),
-                ProbeModel {
-                    canonical,
-                    upstream,
-                },
-            );
+        // Catalog miss (typical for sourcing routes): probe every offered
+        // declaration for this provider (GLM + flash, etc.), not a single
+        // hardcoded model and not undeclared kimi.
+        let declared_models = declared_models_for_provider(&declared, provider);
+        if !declared_models.is_empty() {
+            models.insert(provider.clone(), declared_models);
         }
     }
     ProbeModels { models }
@@ -397,24 +396,27 @@ async fn fetch_declared_offers(
     offers
 }
 
-/// First declared model for `provider`: prefer `is_offered`, else any row.
-fn first_declared_model(
+/// Declared models for `provider`: all `is_offered` rows, or every row if none
+/// are marked offered. Sorted by model id for stable output.
+fn declared_models_for_provider(
     declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
     provider: &Provider,
-) -> Option<(String, Option<String>)> {
+) -> Vec<ProbeModel> {
     let mut rows: Vec<_> = declared
         .iter()
         .filter(|((p, _), _)| p == provider)
         .map(|((_, model), offer)| (model.clone(), offer.clone()))
         .collect();
-    rows.sort_by(|(a, ao), (b, bo)| {
-        bo.is_offered
-            .cmp(&ao.is_offered)
-            .then_with(|| a.cmp(b))
-    });
+    if rows.iter().any(|(_, offer)| offer.is_offered) {
+        rows.retain(|(_, offer)| offer.is_offered);
+    }
+    rows.sort_by(|(a, _), (b, _)| a.cmp(b));
     rows.into_iter()
-        .next()
-        .map(|(model, offer)| (model, offer.upstream_model))
+        .map(|(canonical, offer)| ProbeModel {
+            canonical,
+            upstream: offer.upstream_model,
+        })
+        .collect()
 }
 
 fn fallback_model(provider: &Provider) -> &'static str {
@@ -427,9 +429,8 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
-        // Last resort only when `/miners/me` has no kubetee offer. KubeTEE is
-        // not in the buyer catalog; do not hardcode kimi-k3 here — miners that
-        // only declare glm would otherwise probe a model they do not serve.
+        // Last resort only when `/miners/me` has no kubetee offer. Prefer GLM
+        // over kimi; flash is probed once declared (see #185 / sources).
         Provider::Kubetee => "z-ai/glm-5.2",
         Provider::Benchmark => "benchmark",
     }
@@ -824,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn first_declared_model_prefers_offered_row() {
+    fn declared_models_include_every_offered_kubetee_route() {
         let mut declared = std::collections::HashMap::new();
         declared.insert(
             (Provider::Kubetee, "moonshotai/kimi-k3".to_owned()),
@@ -840,9 +841,22 @@ mod tests {
                 is_offered: true,
             },
         );
-        let (model, _) = first_declared_model(&declared, &Provider::Kubetee)
-            .expect("declared kubetee offer");
-        assert_eq!(model, "z-ai/glm-5.2");
+        declared.insert(
+            (
+                Provider::Kubetee,
+                "deepseek/deepseek-v4-flash-0731".to_owned(),
+            ),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: true,
+            },
+        );
+        let models = declared_models_for_provider(&declared, &Provider::Kubetee);
+        let ids: Vec<_> = models.iter().map(|m| m.canonical.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]
+        );
     }
 
     #[test]
