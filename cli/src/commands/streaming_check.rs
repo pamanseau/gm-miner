@@ -296,26 +296,37 @@ impl ProbeModels {
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
-/// Sourcing-only providers (e.g. `KubeTEE`) never appear in the buyer catalog, so
-/// when the catalog has no row this probes every **offered** model from
-/// `/miners/me` (e.g. GLM-5.2 and deepseek-v4-flash-0731). If nothing is
-/// declared, [`fallback_model`] is used at print time. The check must never
-/// fail the deploy it advises on.
+/// `KubeTEE` is a sourcing provider, so its supply health is the set of every
+/// **offered** model from `/miners/me` (e.g. GLM-5.2 and
+/// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
+/// nothing is declared, [`fallback_model`] is used at print time. The check
+/// must never fail the deploy it advises on.
 async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels {
     let canonical = fetch_canonical_models(cfg, providers).await;
     let declared = fetch_declared_offers(cfg).await;
 
-    resolve_probe_models(providers, canonical.as_ref(), &declared)
+    resolve_probe_models(providers, &canonical, &declared)
 }
 
 fn resolve_probe_models(
     providers: &[Provider],
-    canonical: Option<&std::collections::HashMap<Provider, String>>,
+    canonical: &std::collections::HashMap<Provider, String>,
     declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
 ) -> ProbeModels {
     let mut models = std::collections::HashMap::new();
     for provider in providers {
-        if let Some(canonical) = canonical.and_then(|models| models.get(provider)).cloned() {
+        // KubeTEE's offered sourcing routes are the supply being checked. Use
+        // `/miners/me` as their authority even when `/products` is unavailable
+        // or later gains an unrelated KubeTEE buyer-catalog row.
+        if *provider == Provider::Kubetee {
+            let declared_models = declared_models_for_provider(declared, provider);
+            if !declared_models.is_empty() {
+                models.insert(provider.clone(), declared_models);
+            }
+            continue;
+        }
+
+        if let Some(canonical) = canonical.get(provider).cloned() {
             let upstream = declared
                 .get(&(provider.clone(), canonical.clone()))
                 .and_then(|offer| offer.upstream_model.clone());
@@ -326,52 +337,40 @@ fn resolve_probe_models(
                     upstream,
                 }],
             );
-            continue;
-        }
-
-        // A confirmed catalog miss is expected for KubeTEE sourcing routes:
-        // probe every offered declaration (GLM + flash, etc.), not a single
-        // hardcoded model and not undeclared kimi. Do not fan out when the
-        // catalog request itself failed, or for providers whose historical
-        // behavior is one fallback probe.
-        if canonical.is_some() && *provider == Provider::Kubetee {
-            let declared_models = declared_models_for_provider(declared, provider);
-            if !declared_models.is_empty() {
-                models.insert(provider.clone(), declared_models);
-            }
         }
     }
     ProbeModels { models }
 }
 
 /// Public `GET /products` → the active canonical model per provider.
-///
-/// `None` means the catalog could not be fetched or decoded. `Some(empty)` is
-/// a successful catalog response with no active row for the requested
-/// providers; callers keep those states distinct to avoid outage-time fanout.
 async fn fetch_canonical_models(
     cfg: &Config,
     providers: &[Provider],
-) -> Option<std::collections::HashMap<Provider, String>> {
+) -> std::collections::HashMap<Provider, String> {
     let url = format!("{}/products", cfg.api_url());
-    let client = build_http_client().ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let catalog = resp.json::<ProductCatalogResponse>().await.ok()?;
+    let catalog = match build_http_client() {
+        Ok(client) => match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<ProductCatalogResponse>().await.ok()
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    };
 
     let mut models = std::collections::HashMap::new();
-    for provider in providers {
-        if let Some(product) = catalog
-            .products
-            .iter()
-            .find(|product| product.provider == provider.as_str() && product.status == "active")
-        {
-            models.insert(provider.clone(), product.model.clone());
+    if let Some(catalog) = catalog {
+        for provider in providers {
+            if let Some(product) = catalog
+                .products
+                .iter()
+                .find(|product| product.provider == provider.as_str() && product.status == "active")
+            {
+                models.insert(provider.clone(), product.model.clone());
+            }
         }
     }
-    Some(models)
+    models
 }
 
 #[derive(Debug, Clone)]
@@ -889,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_outage_does_not_fan_out_declared_kubetee_routes() {
+    fn catalog_outage_still_checks_every_declared_kubetee_route() {
         let mut declared = std::collections::HashMap::new();
         for model in ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"] {
             declared.insert(
@@ -901,10 +900,14 @@ mod tests {
             );
         }
 
-        let catalog = resolve_probe_models(&[Provider::Kubetee], None, &declared);
+        let canonical = std::collections::HashMap::new();
+        let catalog = resolve_probe_models(&[Provider::Kubetee], &canonical, &declared);
         let models = catalog.models_for(&Provider::Kubetee);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].canonical, "z-ai/glm-5.2");
+        let ids: Vec<_> = models
+            .iter()
+            .map(|model| model.canonical.as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
     }
 
     #[test]
@@ -921,7 +924,7 @@ mod tests {
         }
         let canonical = std::collections::HashMap::new();
 
-        let catalog = resolve_probe_models(&[Provider::Kubetee], Some(&canonical), &declared);
+        let catalog = resolve_probe_models(&[Provider::Kubetee], &canonical, &declared);
         let models = catalog.models_for(&Provider::Kubetee);
         let ids: Vec<_> = models
             .iter()
@@ -931,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_non_kubetee_catalog_miss_keeps_one_fallback_probe() {
+    fn catalog_outage_does_not_fan_out_non_kubetee_routes() {
         let mut declared = std::collections::HashMap::new();
         for model in ["gpt-5.5", "gpt-5.5-mini"] {
             declared.insert(
@@ -943,11 +946,34 @@ mod tests {
             );
         }
         let canonical = std::collections::HashMap::new();
-
-        let catalog = resolve_probe_models(&[Provider::OpenAI], Some(&canonical), &declared);
+        let catalog = resolve_probe_models(&[Provider::OpenAI], &canonical, &declared);
         let models = catalog.models_for(&Provider::OpenAI);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].canonical, "gpt-5.5");
+    }
+
+    #[test]
+    fn kubetee_supply_routes_win_over_a_catalog_row() {
+        let mut declared = std::collections::HashMap::new();
+        for model in ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"] {
+            declared.insert(
+                (Provider::Kubetee, model.to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            );
+        }
+        let canonical =
+            std::collections::HashMap::from([(Provider::Kubetee, "z-ai/glm-5.2".to_owned())]);
+
+        let catalog = resolve_probe_models(&[Provider::Kubetee], &canonical, &declared);
+        let models = catalog.models_for(&Provider::Kubetee);
+        let ids: Vec<_> = models
+            .iter()
+            .map(|model| model.canonical.as_str())
+            .collect();
+        assert_eq!(ids, vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
     }
 
     #[test]
