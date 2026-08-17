@@ -294,29 +294,40 @@ impl ProbeModels {
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
-/// Both lookups are best-effort — a failed catalog or offer fetch degrades to
-/// the canonical [`fallback_model`], and a missing upstream mapping simply
-/// sends the canonical id. The check must never fail the deploy it advises on.
+/// Sourcing-only providers (e.g. KubeTEE) never appear in the buyer catalog, so
+/// when the catalog has no row this falls back to an **offered** model from
+/// `/miners/me` (preferring `is_offered`), then [`fallback_model`]. The check
+/// must never fail the deploy it advises on.
 async fn fetch_probe_models(cfg: &Config, providers: &[Provider]) -> ProbeModels {
     let canonical = fetch_canonical_models(cfg, providers).await;
-    let upstream = fetch_declared_upstreams(cfg).await;
+    let declared = fetch_declared_offers(cfg).await;
 
     let mut models = std::collections::HashMap::new();
     for provider in providers {
-        let Some(canonical) = canonical.get(provider).cloned() else {
+        if let Some(canonical) = canonical.get(provider).cloned() {
+            let upstream = declared
+                .get(&(provider.clone(), canonical.clone()))
+                .and_then(|offer| offer.upstream_model.clone());
+            models.insert(
+                provider.clone(),
+                ProbeModel {
+                    canonical,
+                    upstream,
+                },
+            );
             continue;
-        };
-        let upstream = upstream
-            .get(&(provider.clone(), canonical.clone()))
-            .cloned()
-            .flatten();
-        models.insert(
-            provider.clone(),
-            ProbeModel {
-                canonical,
-                upstream,
-            },
-        );
+        }
+        // Catalog miss (typical for sourcing routes): probe what this miner
+        // actually declared, not an unrelated hardcoded model.
+        if let Some((canonical, upstream)) = first_declared_model(&declared, provider) {
+            models.insert(
+                provider.clone(),
+                ProbeModel {
+                    canonical,
+                    upstream,
+                },
+            );
+        }
     }
     ProbeModels { models }
 }
@@ -352,28 +363,58 @@ async fn fetch_canonical_models(
     models
 }
 
-/// Authenticated `GET /miners/me` → the miner's own declared upstream mapping,
-/// keyed by `(provider, canonical model)`. Empty when the miner is not logged
-/// in or the registry omits the field.
-async fn fetch_declared_upstreams(
+#[derive(Debug, Clone)]
+struct DeclaredOffer {
+    upstream_model: Option<String>,
+    is_offered: bool,
+}
+
+/// Authenticated `GET /miners/me` → declared offers keyed by `(provider, model)`.
+async fn fetch_declared_offers(
     cfg: &Config,
-) -> std::collections::HashMap<(Provider, String), Option<String>> {
+) -> std::collections::HashMap<(Provider, String), DeclaredOffer> {
     let mut client = RegistryClient::new(cfg.clone());
     let status = match client.get(ME_PATH).await {
         Ok(resp) if resp.status().is_success() => resp.json::<MinerStatus>().await.ok(),
         _ => None,
     };
 
-    let mut upstreams = std::collections::HashMap::new();
+    let mut offers = std::collections::HashMap::new();
     if let Some(status) = status {
         for offer in status.products {
             let Ok(provider) = offer.provider.parse::<Provider>() else {
                 continue;
             };
-            upstreams.insert((provider, offer.model), offer.upstream_model);
+            offers.insert(
+                (provider, offer.model),
+                DeclaredOffer {
+                    upstream_model: offer.upstream_model,
+                    is_offered: offer.is_offered,
+                },
+            );
         }
     }
-    upstreams
+    offers
+}
+
+/// First declared model for `provider`: prefer `is_offered`, else any row.
+fn first_declared_model(
+    declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
+    provider: &Provider,
+) -> Option<(String, Option<String>)> {
+    let mut rows: Vec<_> = declared
+        .iter()
+        .filter(|((p, _), _)| p == provider)
+        .map(|((_, model), offer)| (model.clone(), offer.clone()))
+        .collect();
+    rows.sort_by(|(a, ao), (b, bo)| {
+        bo.is_offered
+            .cmp(&ao.is_offered)
+            .then_with(|| a.cmp(b))
+    });
+    rows.into_iter()
+        .next()
+        .map(|(model, offer)| (model, offer.upstream_model))
 }
 
 fn fallback_model(provider: &Provider) -> &'static str {
@@ -386,8 +427,9 @@ fn fallback_model(provider: &Provider) -> &'static str {
         Provider::Zai | Provider::Engy | Provider::Moonmath => "glm-5.2",
         Provider::Moonshot => "kimi-k3",
         Provider::DeepInfra => "zai-org/GLM-5.2",
-        // KubeTEE routes are not buyer-catalog products, so check-streaming
-        // always uses this fallback. Prefer the live GLM offer over kimi-k3.
+        // Last resort only when `/miners/me` has no kubetee offer. KubeTEE is
+        // not in the buyer catalog; do not hardcode kimi-k3 here — miners that
+        // only declare glm would otherwise probe a model they do not serve.
         Provider::Kubetee => "z-ai/glm-5.2",
         Provider::Benchmark => "benchmark",
     }
@@ -779,6 +821,28 @@ mod tests {
             Value::String("z-ai/glm-5.2".to_owned())
         );
         assert_eq!(probe.model, "z-ai/glm-5.2");
+    }
+
+    #[test]
+    fn first_declared_model_prefers_offered_row() {
+        let mut declared = std::collections::HashMap::new();
+        declared.insert(
+            (Provider::Kubetee, "moonshotai/kimi-k3".to_owned()),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: false,
+            },
+        );
+        declared.insert(
+            (Provider::Kubetee, "z-ai/glm-5.2".to_owned()),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: true,
+            },
+        );
+        let (model, _) = first_declared_model(&declared, &Provider::Kubetee)
+            .expect("declared kubetee offer");
+        assert_eq!(model, "z-ai/glm-5.2");
     }
 
     #[test]
