@@ -274,7 +274,7 @@ fn non_empty(value: Option<&str>) -> bool {
 }
 
 struct ProbeModels {
-    /// One or more models to probe per provider. Sourcing providers (KubeTEE)
+    /// One or more models to probe per provider. Sourcing providers (`KubeTEE`)
     /// may declare several routes (e.g. `z-ai/glm-5.2` and
     /// `deepseek/deepseek-v4-flash-0731`); each gets its own check.
     models: std::collections::HashMap<Provider, Vec<ProbeModel>>,
@@ -296,7 +296,7 @@ impl ProbeModels {
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
-/// Sourcing-only providers (e.g. KubeTEE) never appear in the buyer catalog, so
+/// Sourcing-only providers (e.g. `KubeTEE`) never appear in the buyer catalog, so
 /// when the catalog has no row this probes every **offered** model from
 /// `/miners/me` (e.g. GLM-5.2 and deepseek-v4-flash-0731). If nothing is
 /// declared, [`fallback_model`] is used at print time. The check must never
@@ -396,20 +396,18 @@ async fn fetch_declared_offers(
     offers
 }
 
-/// Declared models for `provider`: all `is_offered` rows, or every row if none
-/// are marked offered. Sorted by model id for stable output.
+/// Every currently offered model for `provider`, sorted by model id for stable
+/// output. Withdrawn rows remain in `/miners/me` for audit, so they must not be
+/// probed merely because no live offer remains.
 fn declared_models_for_provider(
     declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
     provider: &Provider,
 ) -> Vec<ProbeModel> {
     let mut rows: Vec<_> = declared
         .iter()
-        .filter(|((p, _), _)| p == provider)
+        .filter(|((p, _), offer)| p == provider && offer.is_offered)
         .map(|((_, model), offer)| (model.clone(), offer.clone()))
         .collect();
-    if rows.iter().any(|(_, offer)| offer.is_offered) {
-        rows.retain(|(_, offer)| offer.is_offered);
-    }
     rows.sort_by(|(a, _), (b, _)| a.cmp(b));
     rows.into_iter()
         .map(|(canonical, offer)| ProbeModel {
@@ -853,10 +851,29 @@ mod tests {
         );
         let models = declared_models_for_provider(&declared, &Provider::Kubetee);
         let ids: Vec<_> = models.iter().map(|m| m.canonical.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]
+        assert_eq!(ids, vec!["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.2"]);
+    }
+
+    #[test]
+    fn withdrawn_kubetee_routes_degrade_to_the_fallback() {
+        let mut declared = std::collections::HashMap::new();
+        declared.insert(
+            (Provider::Kubetee, "moonshotai/kimi-k3".to_owned()),
+            DeclaredOffer {
+                upstream_model: None,
+                is_offered: false,
+            },
         );
+
+        let declared_models = declared_models_for_provider(&declared, &Provider::Kubetee);
+        assert!(declared_models.is_empty());
+
+        let catalog = ProbeModels {
+            models: std::collections::HashMap::new(),
+        };
+        let models = catalog.models_for(&Provider::Kubetee);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].canonical, "z-ai/glm-5.2");
     }
 
     #[test]
