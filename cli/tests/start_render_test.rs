@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "6f56cc62543e3835ade280912cd29ac3c140724d5be0b8b4350e8e8fea3974eb";
+    "c59a3077e5e1a8584f9a235ec3d728401aad580f0425e71ad4c7f9a1b63ec8f2";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,6 +104,7 @@ fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
     // llm.kubetee.ai serves the OpenAI-compatible surface under /v1 itself
     // and negotiates h2 over ALPN, so the route must NOT carry deepinfra's
     // /v1/openai rewrite and the cluster must NOT force http/1.1.
+    // TLS 1.3 is mandatory for KubeTEE; Envoy's client default max is 1.2.
     let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
     assert!(status.success(), "render failed: {stderr}");
     let cluster = rendered
@@ -113,6 +114,14 @@ fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
     assert!(
         cluster.contains("http2_protocol_options: {}"),
         "kubetee upstream negotiates h2"
+    );
+    assert!(
+        cluster.contains("tls_minimum_protocol_version: TLSv1_3"),
+        "kubetee requires TLS 1.3"
+    );
+    assert!(
+        cluster.contains("tls_maximum_protocol_version: TLSv1_3"),
+        "kubetee requires TLS 1.3"
     );
     assert!(
         cluster.contains("exact: llm.kubetee.ai"),
