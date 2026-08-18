@@ -136,9 +136,11 @@ gmcli set-api-keys --anthropic "sk-ant-a;sk-ant-b;sk-ant-c"
 
 See [multi-key slots](docs/multi-key-slots.md) for the slot behavior and limits.
 
-DeepInfra, Engy, KubeTEE, Moonmath and NEAR are *sourcing* upstreams: they do not appear in the buyer
-catalog under their own names. Each can serve the existing `zai/glm-5.2` and
-`moonshot/kimi-k3` products; the precise upstream model ids are listed in the
+DeepInfra, Engy, Moonmath, NEAR, and KubeTEE's GLM/Kimi routes are *sourcing*
+upstreams: they serve buyer products under existing names rather than appearing
+in the catalog under their own names. KubeTEE's
+`deepseek/deepseek-v4-flash-0731` is instead a buyer-visible product priced against
+DeepSeek's official peak list. The precise model ids are listed in the
 [miner model sourcing matrix](docs/provider-model-support.md). One model can have several such
 routes and none of them is canonical. Setting one of those keys is what makes the matching route
 available to you. A single worker can serve only one route per model, so run two workers to use

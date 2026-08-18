@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-08-12**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-08-18**. This is a miner setup matrix, not a buyer product
 catalog. A direct or named source route is listed only when the GM miner image
 supports its API and GM has reviewed the exact upstream model id. Its
 backticked `provider/model` is the exact pair to pass to
@@ -25,6 +25,7 @@ published.
 | `claude-sonnet-4-6` | Anthropic direct: `anthropic/claude-sonnet-4-6` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `claude-sonnet-5` | Anthropic direct: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
+| `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
@@ -54,8 +55,7 @@ published.
 | `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`); NEAR confidential inference: `near/Qwen/Qwen3.6-27B-FP8` (`--near`) |
 | `Qwen3.8 27B` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 
-KubeTEE also advertises `deepseek/deepseek-v4-flash-0731`,
-`qwen/qwen3.5-397b-a17b`, and `xiaomi/mimo-v2.5`. They are not listed as
-sources because GM has not reviewed exact model equivalence, pricing, and
-capability limits for those KubeTEE variants. An upstream catalog entry alone
-is not a safe mining route.
+KubeTEE also advertises `qwen/qwen3.5-397b-a17b` and `xiaomi/mimo-v2.5`. They
+are not listed as sources because GM has not reviewed exact model equivalence,
+pricing, and capability limits for those KubeTEE variants. An upstream catalog
+entry alone is not a safe mining route.
