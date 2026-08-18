@@ -352,8 +352,9 @@ enum Command {
 
     /// Check whether the deployed miner streams tokens or buffers upstream output.
     ///
-    /// Sends one tiny streaming inference request per configured provider
-    /// through the miner's own data plane using the stored worker node secret.
+    /// Sends a tiny streaming inference request through the miner's own data
+    /// plane for each configured provider and each offered `KubeTEE` sourcing
+    /// route, using the stored worker node secret.
     /// Buffered output usually means Azure `OpenAI`'s synchronous content filter
     /// is delaying token delivery.
     #[command(after_help = "Examples:\n  \
