@@ -90,21 +90,22 @@ exec sleep 30
 }
 
 #[test]
-fn failed_near_readiness_prevents_every_serving_process() {
-    let (output, markers) = run_start(42, None, None);
-    assert_eq!(output.status.code(), Some(42));
-    assert!(markers.join("near-preflight").exists());
-    assert!(!markers.join("near-runtime").exists());
-    assert!(!markers.join("attestd").exists());
-    assert!(!markers.join("envoy").exists());
+fn failed_near_target_does_not_prevent_other_models_from_starting() {
+    let (output, markers) = run_start(42, None, Some(17));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(17), "{stderr}");
+    assert!(!markers.join("near-preflight").exists());
+    assert!(markers.join("near-runtime").exists());
+    assert!(markers.join("attestd").exists());
+    assert!(markers.join("envoy").exists());
 }
 
 #[test]
-fn envoy_starts_only_after_near_readiness_and_runtime_start() {
+fn envoy_starts_after_near_runtime_start() {
     let (output, markers) = run_start(0, None, Some(17));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(17), "{stderr}");
-    assert!(markers.join("near-preflight").exists());
+    assert!(!markers.join("near-preflight").exists());
     assert!(markers.join("near-runtime").exists());
     assert!(markers.join("attestd").exists());
     assert!(markers.join("envoy").exists());
