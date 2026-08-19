@@ -30,9 +30,12 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `moonmath/kimi-k3` | `zro.moonmath.ai` | `--moonmath` |
 | `chutes/zai-org/GLM-5.1-TEE` | `near/zai-org/GLM-5.1-FP8` | `glm-5-1.completions.near.ai` | `--near` |
 | `chutes/Qwen/Qwen3.6-27B-TEE` | `near/Qwen/Qwen3.6-27B-FP8` | `qwen3-6-27b.completions.near.ai` | `--near` |
+| `chutes/zai-org/GLM-5.2-TEE` | `near/z-ai/glm-5.2` | `glm-5-2-long.completions.near.ai` | `--near` |
+| `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` | `near/deepseek-ai/DeepSeek-V4-Flash` | `dsv4-flash.completions.near.ai` | `--near` |
+| `chutes/google/gemma-4-31B-turbo-TEE` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
 
-Both buyer products can also be served **direct** — with a Z.ai key (`--zai`) or a
-Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
+The Z.ai and Moonshot buyer products can also be served **direct** — with a Z.ai key
+(`--zai`) or a Moonshot key (`--moonshot`). Direct is not the canonical route, but it does carry one
 concrete advantage: where a worker could serve a product both directly and through a
 route, the router keeps the direct one (see below).
 
@@ -145,6 +148,9 @@ gmcli declare-product --provider moonmath --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider moonmath --model kimi-k3 --discount-pct 5
 gmcli declare-product --provider near --model zai-org/GLM-5.1-FP8 --discount-pct 5
 gmcli declare-product --provider near --model Qwen/Qwen3.6-27B-FP8 --discount-pct 5
+gmcli declare-product --provider near --model z-ai/glm-5.2 --discount-pct 5
+gmcli declare-product --provider near --model deepseek-ai/DeepSeek-V4-Flash --discount-pct 5
+gmcli declare-product --provider near --model google/gemma-4-31B-it --discount-pct 5
 ```
 
 ### NEAR attestation enforcement

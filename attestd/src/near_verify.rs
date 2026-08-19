@@ -45,7 +45,7 @@ pub struct NearTarget {
     pub host: &'static str,
 }
 
-pub const TARGETS: [NearTarget; 2] = [
+pub const TARGETS: [NearTarget; 6] = [
     NearTarget {
         model: "zai-org/GLM-5.1-FP8",
         host: "glm-5-1.completions.near.ai",
@@ -53,6 +53,22 @@ pub const TARGETS: [NearTarget; 2] = [
     NearTarget {
         model: "Qwen/Qwen3.6-27B-FP8",
         host: "qwen3-6-27b.completions.near.ai",
+    },
+    NearTarget {
+        model: "z-ai/glm-5.2",
+        host: "glm-5-2-long.completions.near.ai",
+    },
+    NearTarget {
+        model: "deepseek-ai/DeepSeek-V4-Flash",
+        host: "dsv4-flash.completions.near.ai",
+    },
+    NearTarget {
+        model: "google/gemma-4-31B-it",
+        host: "gemma-4-31b.completions.near.ai",
+    },
+    NearTarget {
+        model: "Qwen/Qwen3.8-27B",
+        host: "qwen3-8-27b.completions.near.ai",
     },
 ];
 
@@ -663,6 +679,28 @@ mod tests {
     #[test]
     fn unknown_selector_has_no_network_target() {
         assert!(target_for_model("attacker/model").is_none());
+    }
+
+    #[test]
+    fn every_qualified_near_chat_target_is_closed_listed() {
+        let actual = TARGETS
+            .iter()
+            .map(|target| (target.model, target.host))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ("zai-org/GLM-5.1-FP8", "glm-5-1.completions.near.ai"),
+                ("Qwen/Qwen3.6-27B-FP8", "qwen3-6-27b.completions.near.ai"),
+                ("z-ai/glm-5.2", "glm-5-2-long.completions.near.ai"),
+                (
+                    "deepseek-ai/DeepSeek-V4-Flash",
+                    "dsv4-flash.completions.near.ai",
+                ),
+                ("google/gemma-4-31B-it", "gemma-4-31b.completions.near.ai"),
+                ("Qwen/Qwen3.8-27B", "qwen3-8-27b.completions.near.ai"),
+            ]
+        );
     }
 
     #[test]

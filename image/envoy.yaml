@@ -923,7 +923,11 @@ static_resources:
                             if provider == "near" and bare ~= "/v1/models" then
                               local model = headers:get("x-gm-upstream-model")
                               if model ~= "zai-org/GLM-5.1-FP8"
-                                and model ~= "Qwen/Qwen3.6-27B-FP8" then
+                                and model ~= "Qwen/Qwen3.6-27B-FP8"
+                                and model ~= "z-ai/glm-5.2"
+                                and model ~= "deepseek-ai/DeepSeek-V4-Flash"
+                                and model ~= "google/gemma-4-31B-it"
+                                and model ~= "Qwen/Qwen3.8-27B" then
                                 handle:respond(
                                   {[":status"] = "400",
                                    ["content-type"] = "application/json"},
