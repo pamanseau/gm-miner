@@ -25,13 +25,13 @@ published.
 | `claude-sonnet-4-6` | Anthropic direct: `anthropic/claude-sonnet-4-6` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `claude-sonnet-5` | Anthropic direct: `anthropic/claude-sonnet-5` (`--anthropic`); AWS Bedrock; Microsoft Foundry |
 | `DeepSeek V3.2 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V3.2-TEE` (`--chutes`) |
-| `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`) |
-| `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`) |
+| `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
+| `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
 | `GLM-5.2` | Z.ai direct: `zai/glm-5.2` (`--zai`); DeepInfra: `deepinfra/zai-org/GLM-5.2` (`--deepinfra`); Engy: `engy/glm-5.2` (`--engy`); KubeTEE: `kubetee/z-ai/glm-5.2` (`--kubetee`); Moonmath ZRO: `moonmath/glm-5.2` (`--moonmath`) |
-| `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`) |
+| `GLM-5.2 TEE` | Chutes: `chutes/zai-org/GLM-5.2-TEE` (`--chutes`); NEAR confidential inference: `near/z-ai/glm-5.2` (`--near`) |
 | `GPT-5.4` | OpenAI direct: `openai/gpt-5.4` (`--openai`); Azure OpenAI (`--openai-upstream azure`) |
 | `GPT-5.4 mini` | OpenAI direct: `openai/gpt-5.4-mini` (`--openai`); Azure OpenAI |
 | `GPT-5.4 nano` | OpenAI direct: `openai/gpt-5.4-nano` (`--openai`); Azure OpenAI |
@@ -52,6 +52,7 @@ published.
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |
 | `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`); NEAR confidential inference: `near/Qwen/Qwen3.6-27B-FP8` (`--near`) |
+| `Qwen3.8 27B` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 
 KubeTEE also advertises `deepseek/deepseek-v4-flash-0731`,
 `qwen/qwen3.5-397b-a17b`, and `xiaomi/mimo-v2.5`. They are not listed as

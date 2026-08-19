@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "e40cc87be914e09a08349fb091e170b99cf927b03b98f6acf2cd04a63699dcc7";
+    "6eed28f6a147e728e70ff0cd4978b659e3b69eb6ca02fedafb860640776d5c0e";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -183,6 +183,10 @@ fn near_route_has_no_direct_origin_bypass_and_never_renders_the_key() {
     assert!(rendered.contains("port_value: 8082"));
     assert!(rendered.contains("zai-org/GLM-5.1-FP8"));
     assert!(rendered.contains("Qwen/Qwen3.6-27B-FP8"));
+    assert!(rendered.contains("z-ai/glm-5.2"));
+    assert!(rendered.contains("deepseek-ai/DeepSeek-V4-Flash"));
+    assert!(rendered.contains("google/gemma-4-31B-it"));
+    assert!(rendered.contains("Qwen/Qwen3.8-27B"));
     assert!(!rendered.contains("glm-5-1.completions.near.ai"));
     assert!(!rendered.contains("qwen3-6-27b.completions.near.ai"));
     assert!(!rendered.contains("near-secret"));
