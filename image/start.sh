@@ -764,16 +764,15 @@ log "minting data-plane RA-TLS certificate via dstack get_tls_key"
 gm-miner-ratls
 log "RA-TLS certificate ready"
 
-# ── Verify and launch the NEAR attestation proxy ──────────────────────
-# NEAR routes exist only when a key is configured. Before Envoy can expose
-# such a route, verify every closed-list origin once. Each inference is then
-# re-attested by the long-running proxy over the exact TLS connection it
-# forwards on; the startup check is readiness, not a reusable attestation.
+# ── Launch the NEAR attestation proxy ─────────────────────────────────
+# NEAR routes exist only when a key is configured. The long-running proxy
+# verifies each inference over the exact TLS connection it forwards on and
+# fails that request closed. Do not make every closed-list origin a global
+# startup dependency: one unavailable model must not take unrelated models
+# or providers out of service. Process supervision below remains the proxy
+# readiness gate; if the proxy itself exits, the whole container exits.
 NEAR_PROXY_PID=""
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
-  log "verifying NEAR confidential endpoints before starting data plane"
-  gm-near-verify-proxy --verify-once
-  log "NEAR endpoint attestation verification passed"
   log "starting NEAR verification proxy on 127.0.0.1:8082"
   gm-near-verify-proxy &
   NEAR_PROXY_PID=$!
