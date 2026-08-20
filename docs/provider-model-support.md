@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-08-18**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-08-20**. This is a miner setup matrix, not a buyer product
 catalog. A direct or named source route is listed only when the GM miner image
 supports its API and GM has reviewed the exact upstream model id. Its
 backticked `provider/model` is the exact pair to pass to
@@ -49,6 +49,7 @@ published.
 | `Nemotron 3 Nano Omni 30B TEE` | Chutes: `chutes/Nemotron-3-Nano-Omni-30B-TEE` (`--chutes`) |
 | `o3` | OpenAI direct: `openai/o3` (`--openai`); Azure OpenAI |
 | `o4-mini` | OpenAI direct: `openai/o4-mini` (`--openai`); Azure OpenAI |
+| `Ornith 1.5 397B` | KubeTEE: `kubetee/ornith/ornith-1.5-397b` (`--kubetee`) |
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |
