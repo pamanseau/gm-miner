@@ -169,6 +169,46 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_http
+                ## ── Sanitized stream-termination correlation ────────
+                ##  One JSON record per ingress request, written by
+                ##  Envoy's stdout access logger. The fields identify
+                ##  whether the downstream gateway connection or the
+                ##  miner→provider upstream ended the stream and line up
+                ##  with the gateway's X-Gm-Request-Id plus h2 lane log.
+                ##
+                ##  Deliberately absent: URL/path, Authorization,
+                ##  x-gm-node-key, request/response bodies, and arbitrary
+                ##  headers. Provider/product are authenticated routing
+                ##  metadata and contain no buyer content.
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        json_format:
+                          timestamp: "%START_TIME%"
+                          request_id: "%DYNAMIC_METADATA(gm.access_log:request_id)%"
+                          product: "%DYNAMIC_METADATA(gm.access_log:product)%"
+                          provider: "%DYNAMIC_METADATA(gm.access_log:provider)%"
+                          authenticated: "%DYNAMIC_METADATA(gm.access_log:authenticated)%"
+                          protocol: "%PROTOCOL%"
+                          response_code: "%RESPONSE_CODE%"
+                          response_flags: "%RESPONSE_FLAGS%"
+                          response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          connection_termination_details: "%CONNECTION_TERMINATION_DETAILS%"
+                          downstream_connection_id: "%CONNECTION_ID%"
+                          downstream_detected_close_type: "%DOWNSTREAM_DETECTED_CLOSE_TYPE%"
+                          downstream_local_close_reason: "%DOWNSTREAM_LOCAL_CLOSE_REASON%"
+                          upstream_transport_failure_reason: "%UPSTREAM_TRANSPORT_FAILURE_REASON%"
+                          upstream_cluster: "%UPSTREAM_CLUSTER%"
+                          upstream_connection_id: "%UPSTREAM_CONNECTION_ID%"
+                          upstream_connection_ids_attempted: "%UPSTREAM_CONNECTION_IDS_ATTEMPTED%"
+                          upstream_detected_close_type: "%UPSTREAM_DETECTED_CLOSE_TYPE%"
+                          upstream_local_close_reason: "%UPSTREAM_LOCAL_CLOSE_REASON%"
+                          duration_ms: "%DURATION%"
+                          bytes_received: "%BYTES_RECEIVED%"
+                          bytes_sent: "%BYTES_SENT%"
+                          stream_id: "%STREAM_ID%"
                 ## ── HTTP/2 via ALPN ─────────────────────────────────
                 ##  Envoy's HCM default is HTTP/1.1 only. `AUTO` selects
                 ##  h1 or h2 per connection based on the ALPN protocol
@@ -915,6 +955,26 @@ static_resources:
                                 return
                               end
                             end
+                            -- Route actions remove gm metadata before the
+                            -- upstream request leaves the CVM. Only after the
+                            -- node key has authenticated the caller, snapshot
+                            -- the three non-secret correlation values into
+                            -- stream-local metadata so teardown can still join
+                            -- this record to the gateway. Never copy node keys,
+                            -- provider auth, paths, or bodies. The authenticated
+                            -- marker lets auditors reject pre-auth local replies.
+                            local access_metadata = handle:streamInfo():dynamicMetadata()
+                            access_metadata:set(
+                              "gm.access_log", "request_id",
+                              headers:get("x-gm-request-id") or "")
+                            access_metadata:set(
+                              "gm.access_log", "product",
+                              headers:get("x-gm-product") or "")
+                            access_metadata:set(
+                              "gm.access_log", "provider",
+                              headers:get("x-gm-provider") or "")
+                            access_metadata:set(
+                              "gm.access_log", "authenticated", true)
                             strip_inbound_auth(headers)
                             local provider = headers:get("x-gm-provider")
                             if provider ~= "near" or bare == "/v1/models" then
