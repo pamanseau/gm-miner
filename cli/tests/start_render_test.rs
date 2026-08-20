@@ -12,7 +12,7 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 const DIRECT_TESTNET_SHA256: &str =
-    "6eed28f6a147e728e70ff0cd4978b659e3b69eb6ca02fedafb860640776d5c0e";
+    "df5b093f301d3cf18ce11f14e2e3a03acf25969fb55cd7423766f5d7645dd4b1";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -135,6 +135,90 @@ fn kubetee_route_keeps_v1_path_and_negotiates_h2() {
         !route.contains("regex_rewrite"),
         "kubetee already serves /v1; a path rewrite would 404 every request"
     );
+}
+
+#[test]
+fn ingress_access_log_correlates_stream_termination_without_secrets() {
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant-direct")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let ingress_hcm = rendered
+        .split_once("stat_prefix: ingress_http")
+        .and_then(|(_, rest)| rest.split_once("route_config:"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(ingress_hcm.contains("name: envoy.access_loggers.stdout"));
+    assert!(ingress_hcm.contains("%DYNAMIC_METADATA(gm.access_log:request_id)%"));
+    assert!(ingress_hcm.contains("%DYNAMIC_METADATA(gm.access_log:product)%"));
+    assert!(ingress_hcm.contains("%DYNAMIC_METADATA(gm.access_log:provider)%"));
+    assert!(ingress_hcm.contains("%DYNAMIC_METADATA(gm.access_log:authenticated)%"));
+    assert!(rendered.contains(
+        "access_metadata:set(\n                              \"gm.access_log\", \"request_id\""
+    ));
+    for field in [
+        "request_id",
+        "product",
+        "provider",
+        "authenticated",
+        "protocol",
+        "response_code",
+        "response_flags",
+        "response_code_details",
+        "connection_termination_details",
+        "downstream_connection_id",
+        "downstream_detected_close_type",
+        "downstream_local_close_reason",
+        "upstream_transport_failure_reason",
+        "upstream_cluster",
+        "upstream_connection_id",
+        "upstream_connection_ids_attempted",
+        "upstream_detected_close_type",
+        "upstream_local_close_reason",
+        "duration_ms",
+        "bytes_received",
+        "bytes_sent",
+        "stream_id",
+    ] {
+        assert!(
+            ingress_hcm.contains(&format!("{field}:")),
+            "missing sanitized access-log field {field}",
+        );
+    }
+
+    for forbidden in ["authorization:", "node_key:", "request_path:", "body:"] {
+        assert!(
+            !ingress_hcm.contains(forbidden),
+            "access log must not include {forbidden}",
+        );
+    }
+
+    let authentication = rendered
+        .find("if presented ~= expected then")
+        .expect("node-key authentication guard");
+    let metadata_snapshot = rendered
+        .find("local access_metadata = handle:streamInfo():dynamicMetadata()")
+        .expect("access-log metadata snapshot");
+    assert!(
+        authentication < metadata_snapshot,
+        "caller-supplied correlation metadata must not be trusted before node-key authentication",
+    );
+    assert!(rendered.contains(
+        "access_metadata:set(\n                              \"gm.access_log\", \"authenticated\", true)"
+    ));
+
+    for secret_header in [
+        "authorization",
+        "x-gm-node-key",
+        "x-gm-gateway-sig",
+        "x-gm-upstream-slot",
+        "x-gm-upstream-model",
+    ] {
+        assert!(
+            !ingress_hcm
+                .to_ascii_lowercase()
+                .contains(&format!("%req({secret_header})%")),
+            "access log must not render request header {secret_header}",
+        );
+    }
 }
 
 #[test]
