@@ -103,8 +103,8 @@ struct ProbeTiming {
 ///
 /// Discovers the worker endpoint from the registry and the matching node secret
 /// from local gmcli config, then sends one streaming probe per configured
-/// provider and per offered `KubeTEE`/NEAR sourcing route. Per-route failures are
-/// reported inline and do not panic.
+/// provider and per offered sourcing route. Per-route failures are reported
+/// inline and do not panic.
 pub(crate) async fn cmd_check_streaming(cfg: Config) -> Result<()> {
     let target = resolve_primary_worker(&cfg).await?;
     run_streaming_checks(&cfg, &target).await;
@@ -317,8 +317,8 @@ fn non_empty(value: Option<&str>) -> bool {
 }
 
 struct ProbeModels {
-    /// One or more models to probe per provider. Sourcing providers (`KubeTEE`, NEAR)
-    /// may declare several routes (e.g. `z-ai/glm-5.2` and
+    /// One or more models to probe per provider. Sourcing providers may
+    /// declare several routes (e.g. `z-ai/glm-5.2` and
     /// `deepseek/deepseek-v4-flash-0731`); each gets its own check.
     models: std::collections::HashMap<Provider, Vec<ProbeModel>>,
 }
@@ -340,8 +340,8 @@ impl ProbeModels {
 /// public catalog, joined with the miner's own declared `upstream_model` (from
 /// `/miners/me`) so cloud-backed offers probe their real upstream deployment.
 ///
-/// `KubeTEE` and NEAR are sourcing providers, so their supply health is every
-/// **offered** model from `/miners/me` (e.g. GLM-5.2 and
+/// Sourcing providers report supply health for every **offered** model from
+/// `/miners/me` (e.g. GLM-5.2 and
 /// deepseek-v4-flash-0731), independent of buyer-catalog availability. If
 /// nothing is declared, [`fallback_model`] is used at print time. The check
 /// must never fail the deploy it advises on.
@@ -364,8 +364,15 @@ fn resolve_probe_models(
     for provider in providers {
         // Offered sourcing routes are the supply being checked. Use
         // `/miners/me` as their authority even when `/products` is unavailable
-        // or later gains an unrelated KubeTEE buyer-catalog row.
-        if matches!(provider, Provider::Kubetee | Provider::Near) {
+        // or later gains an unrelated buyer-catalog row.
+        if matches!(
+            provider,
+            Provider::DeepInfra
+                | Provider::Engy
+                | Provider::Kubetee
+                | Provider::Moonmath
+                | Provider::Near
+        ) {
             let declared_models = declared_models_for_provider(declared, provider);
             if !declared_models.is_empty() {
                 models.insert(provider.clone(), declared_models);
@@ -1020,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_outage_does_not_fan_out_non_kubetee_routes() {
+    fn catalog_outage_does_not_fan_out_a_direct_only_provider() {
         let mut declared = std::collections::HashMap::new();
         for model in ["o5", "o5-mini"] {
             declared.insert(
@@ -1037,6 +1044,59 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].canonical, "gpt-5.5");
         assert!(models[0].fallback);
+    }
+
+    #[test]
+    fn every_offered_engy_and_deepinfra_route_is_probed() {
+        let declared = std::collections::HashMap::from([
+            (
+                (Provider::Engy, "deepseek-v4-flash-0731".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            ),
+            (
+                (Provider::Engy, "qwen3.8-27b".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            ),
+            (
+                (Provider::DeepInfra, "Qwen/Qwen3.6-35B-A3B".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            ),
+            (
+                (Provider::DeepInfra, "Qwen/Qwen3.8-27B".to_owned()),
+                DeclaredOffer {
+                    upstream_model: None,
+                    is_offered: true,
+                },
+            ),
+        ]);
+        let catalog = resolve_probe_models(
+            &[Provider::Engy, Provider::DeepInfra],
+            &std::collections::HashMap::new(),
+            &declared,
+        );
+
+        let engy: Vec<_> = catalog
+            .models_for(&Provider::Engy)
+            .into_iter()
+            .map(|model| model.canonical)
+            .collect();
+        assert_eq!(engy, ["deepseek-v4-flash-0731", "qwen3.8-27b"]);
+
+        let deepinfra: Vec<_> = catalog
+            .models_for(&Provider::DeepInfra)
+            .into_iter()
+            .map(|model| model.canonical)
+            .collect();
+        assert_eq!(deepinfra, ["Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.8-27B"]);
     }
 
     #[test]
