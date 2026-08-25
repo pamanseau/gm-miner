@@ -3,7 +3,7 @@
 Use this table to answer one question: **I want to provide a model — where can
 I source it from?**
 
-Snapshot date: **2026-08-20**. This is a miner setup matrix, not a buyer product
+Snapshot date: **2026-08-25**. This is a miner setup matrix, not a buyer product
 catalog. A direct or named source route is listed only when the GM miner image
 supports its API and GM has reviewed the exact upstream model id. Its
 backticked `provider/model` is the exact pair to pass to
@@ -53,10 +53,7 @@ published.
 | `Qwen3 235B A22B Thinking 2507 TEE` | Chutes: `chutes/Qwen/Qwen3-235B-A22B-Thinking-2507-TEE` (`--chutes`) |
 | `Qwen3 32B TEE` | Chutes: `chutes/Qwen/Qwen3-32B-TEE` (`--chutes`) |
 | `Qwen3.5 397B A17B TEE` | Chutes: `chutes/Qwen/Qwen3.5-397B-A17B-TEE` (`--chutes`) |
+| `Qwen3.6 35B A3B` | Engy: `engy/qwen3.6-35b-a3b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.6-35B-A3B` (`--deepinfra`) |
 | `Qwen3.6 27B TEE` | Chutes: `chutes/Qwen/Qwen3.6-27B-TEE` (`--chutes`); NEAR confidential inference: `near/Qwen/Qwen3.6-27B-FP8` (`--near`) |
-| `Qwen3.8 27B` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
-
-KubeTEE also advertises `qwen/qwen3.5-397b-a17b` and `xiaomi/mimo-v2.5`. They
-are not listed as sources because GM has not reviewed exact model equivalence,
-pricing, and capability limits for those KubeTEE variants. An upstream catalog
-entry alone is not a safe mining route.
+| `Qwen3.8 27B` | Engy: `engy/qwen3.8-27b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.8-27B` (`--deepinfra`) |
+| `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
