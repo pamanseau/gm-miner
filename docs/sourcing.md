@@ -25,6 +25,7 @@ explains the table and how to set each upstream up.
 | `engy/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
 | `engy/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
+| `kubetee/deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `engy/kimi-k3` | `api.engy.ai` | `--engy` |
