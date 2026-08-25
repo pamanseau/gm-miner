@@ -1,6 +1,9 @@
 //! `gmcli check-streaming` — detect buffered upstream streaming.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
@@ -47,6 +50,21 @@ enum StreamingVerdict {
 struct StreamingTarget {
     endpoint: String,
     node_secret: String,
+    /// Exact provider/model coverage reported for the selected worker.
+    /// `None` is reserved for the immediate post-deploy advisory, where the
+    /// just-used configuration is authoritative. `Some(empty)` means registry
+    /// ownership is unknown and must be reported as inconclusive, not guessed.
+    provider_models: Option<HashMap<Provider, ProviderModelCoverage>>,
+    /// Providers this deployed worker sends through Azure/Bedrock/Foundry.
+    /// Their direct probe must have the offer's declared upstream deployment
+    /// id; silently sending the canonical gm id would be a false failure.
+    requires_upstream_model: HashSet<Provider>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderModelCoverage {
+    unscoped: BTreeSet<String>,
+    by_slot: HashMap<String, BTreeSet<String>>,
 }
 
 struct ProviderProbe {
@@ -54,6 +72,7 @@ struct ProviderProbe {
     /// Canonical gm model id, shown in output. The request body carries the
     /// upstream deployment id when the offer declared one (see [`ProbeModel`]).
     model: String,
+    slot: Option<String>,
     fallback: bool,
     path: &'static str,
     body: Value,
@@ -61,12 +80,23 @@ struct ProviderProbe {
 
 impl ProviderProbe {
     fn model_label(&self) -> String {
-        if self.fallback {
+        let model = if self.fallback {
             format!("{} [fallback]", self.model)
         } else {
             self.model.clone()
+        };
+        if let Some(slot) = &self.slot {
+            format!("{model} [slot {slot}]")
+        } else {
+            model
         }
     }
+}
+
+#[derive(Clone)]
+struct SelectedProbeModel {
+    model: ProbeModel,
+    slot: Option<String>,
 }
 
 /// The two model ids a probe needs: the canonical gm id for display and the
@@ -121,35 +151,56 @@ pub(crate) async fn deploy_streaming_advisory(cfg: &Config, endpoint: &str, node
     let target = StreamingTarget {
         endpoint: endpoint.to_owned(),
         node_secret: node_secret.to_owned(),
+        provider_models: None,
+        requires_upstream_model: cfg
+            .provider_keys
+            .as_ref()
+            .map(|keys| providers_from_backends(&keys.worker_backends()))
+            .unwrap_or_default(),
     };
     run_streaming_checks(cfg, &target).await;
 }
 
 async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
-    let providers = match configured_providers(cfg.provider_keys.as_ref()) {
-        Ok(providers) => providers,
-        Err(err) => {
-            println!("  [!!] provider config invalid: {err}");
-            return;
+    let configured = if target.provider_models.is_none() {
+        match configured_providers(cfg.provider_keys.as_ref()) {
+            Ok(providers) => providers,
+            Err(err) => {
+                println!("  [!!] provider config invalid: {err}");
+                return;
+            }
         }
+    } else {
+        Vec::new()
     };
+    let providers = providers_for_target(&configured, target);
 
     let declared = fetch_declared_offers(cfg).await;
-    if let Some(declared) = declared.as_ref() {
-        for provider in offered_providers_missing_local(declared, &providers) {
-            println!(
-                "  [--] {provider}: registry has offered routes but no local key is configured; supply was not probed"
-            );
+    if target.provider_models.is_none() {
+        if let Some(declared) = declared.as_ref() {
+            for provider in offered_providers_missing_local(declared, &configured) {
+                println!(
+                    "  [--] {provider}: registry has offered routes but no local key is configured; supply was not probed"
+                );
+            }
         }
     }
 
     if providers.is_empty() {
-        println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
+        if target.provider_models.is_some() {
+            println!(
+                "  [--] selected worker has no verified provider/model coverage; supply probe is inconclusive"
+            );
+        } else if configured.is_empty() {
+            println!("  [--] no configured providers to check; run `gmcli set-api-keys` first");
+        } else {
+            println!("  [--] selected worker advertises no locally configured provider slots");
+        }
         return;
     }
 
     if declared.is_none() {
-        for provider in [Provider::Kubetee, Provider::Near] {
+        for provider in sourcing_providers() {
             if providers.contains(&provider) {
                 println!(
                     "  [--] {provider}: could not read declared offers; probing fallback only (offered-route coverage unknown)"
@@ -166,8 +217,22 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
     )
     .await;
     for provider in providers {
-        for model in model_catalog.models_for(&provider) {
-            let probe = build_probe(provider.clone(), &model);
+        let Some(models) =
+            models_for_target(target, &provider, model_catalog.models_for(&provider))
+        else {
+            println!(
+                "  [--] {provider}: selected worker's exact model coverage or declared upstream deployment is unknown; supply probe is inconclusive"
+            );
+            continue;
+        };
+        if models.is_empty() {
+            println!(
+                "  [--] {provider}: no probe model overlaps the selected worker's verified coverage; supply probe is inconclusive"
+            );
+            continue;
+        }
+        for selected in models {
+            let probe = build_probe(provider.clone(), &selected.model, selected.slot);
             let result = run_provider_probe(target, &probe).await;
             print_probe_result(&probe, result);
         }
@@ -224,10 +289,9 @@ fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<St
     let worker_id = first_live_worker_id(live).ok_or_else(|| {
         anyhow::anyhow!("registry lists no live worker; run `gmcli deploy` first")
     })?;
-    let endpoint = live
+    let worker = live
         .iter()
         .find(|worker| worker.worker_id == worker_id)
-        .map(|worker| worker.endpoint.clone())
         .ok_or_else(|| anyhow::anyhow!("internal error: live worker {worker_id} vanished"))?;
     let record = local
         .iter()
@@ -241,9 +305,141 @@ fn pick_target_worker(local: &[WorkerRecord], live: &[WorkerEntry]) -> Result<St
     validate_local_worker(record)?;
 
     Ok(StreamingTarget {
-        endpoint,
+        endpoint: worker.endpoint.clone(),
         node_secret: record.node_secret.clone(),
+        provider_models: Some(worker_provider_models(worker)),
+        requires_upstream_model: record
+            .backends
+            .as_ref()
+            .map(providers_from_backends)
+            .unwrap_or_default(),
     })
+}
+
+fn providers_from_backends(
+    backends: &std::collections::BTreeMap<String, String>,
+) -> HashSet<Provider> {
+    backends
+        .keys()
+        .filter_map(|provider| provider.parse().ok())
+        .collect()
+}
+
+fn providers_for_target(configured: &[Provider], target: &StreamingTarget) -> Vec<Provider> {
+    let Some(worker_providers) = target.provider_models.as_ref() else {
+        return configured.to_vec();
+    };
+    let mut providers: Vec<_> = worker_providers.keys().cloned().collect();
+    providers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    providers
+}
+
+fn worker_provider_models(worker: &WorkerEntry) -> HashMap<Provider, ProviderModelCoverage> {
+    let mut coverage = HashMap::<Provider, ProviderModelCoverage>::new();
+    for (provider, models) in &worker.supported_models {
+        let Ok(provider) = provider.parse() else {
+            continue;
+        };
+        coverage
+            .entry(provider)
+            .or_default()
+            .unscoped
+            .extend(models.clone());
+    }
+    for (provider, slots) in &worker.provider_slot_status {
+        let Ok(provider) = provider.parse() else {
+            continue;
+        };
+        let provider_coverage = coverage.entry(provider).or_default();
+        for (slot_id, slot) in slots {
+            if slot.status.as_deref() != Some("verified") {
+                continue;
+            }
+            provider_coverage
+                .by_slot
+                .entry(slot_id.clone())
+                .or_default()
+                .extend(slot.models.iter().cloned());
+        }
+    }
+    coverage
+}
+
+fn models_for_target(
+    target: &StreamingTarget,
+    provider: &Provider,
+    mut models: Vec<ProbeModel>,
+) -> Option<Vec<SelectedProbeModel>> {
+    if target.requires_upstream_model.contains(provider) {
+        models.retain(|model| model.upstream.is_some());
+        if models.is_empty() {
+            return None;
+        }
+    }
+    let Some(worker_coverage) = target
+        .provider_models
+        .as_ref()
+        .and_then(|providers| providers.get(provider))
+    else {
+        let models = if target.provider_models.is_none() && !sourcing_providers().contains(provider)
+        {
+            models.into_iter().take(1).collect()
+        } else {
+            models
+        };
+        return Some(
+            models
+                .into_iter()
+                .map(|model| SelectedProbeModel { model, slot: None })
+                .collect(),
+        );
+    };
+    if !worker_coverage.by_slot.is_empty()
+        && worker_coverage.by_slot.values().all(BTreeSet::is_empty)
+    {
+        // Legacy registries reported only the provider-wide union in
+        // `supported_models`. Once verified slots exist that union cannot say
+        // which credential serves which model, and probing it through Envoy's
+        // default slot can produce a false failure.
+        return None;
+    }
+    if worker_coverage.unscoped.is_empty() && worker_coverage.by_slot.is_empty() {
+        return None;
+    }
+    let mut selected = Vec::new();
+    for model in models {
+        let matches = |known: &BTreeSet<String>| {
+            known.contains(&model.canonical) || known.contains(model.wire_model())
+        };
+        let mut slots: Vec<_> = worker_coverage
+            .by_slot
+            .iter()
+            .filter(|(_, known)| matches(known))
+            .map(|(slot, _)| slot.clone())
+            .collect();
+        slots.sort();
+        if slots.is_empty() && worker_coverage.by_slot.is_empty() {
+            if matches(&worker_coverage.unscoped) {
+                selected.push(SelectedProbeModel { model, slot: None });
+            }
+        } else {
+            selected.extend(slots.into_iter().map(|slot| SelectedProbeModel {
+                model: model.clone(),
+                slot: Some(slot),
+            }));
+        }
+    }
+    Some(selected)
+}
+
+fn sourcing_providers() -> [Provider; 5] {
+    [
+        Provider::DeepInfra,
+        Provider::Engy,
+        Provider::Kubetee,
+        Provider::Moonmath,
+        Provider::Near,
+    ]
 }
 
 fn validate_local_worker(worker: &WorkerRecord) -> Result<()> {
@@ -357,7 +553,7 @@ async fn fetch_probe_models(
 
 fn resolve_probe_models(
     providers: &[Provider],
-    canonical: &std::collections::HashMap<Provider, String>,
+    canonical: &std::collections::HashMap<Provider, Vec<String>>,
     declared: &std::collections::HashMap<(Provider, String), DeclaredOffer>,
 ) -> ProbeModels {
     let mut models = std::collections::HashMap::new();
@@ -365,14 +561,7 @@ fn resolve_probe_models(
         // Offered sourcing routes are the supply being checked. Use
         // `/miners/me` as their authority even when `/products` is unavailable
         // or later gains an unrelated buyer-catalog row.
-        if matches!(
-            provider,
-            Provider::DeepInfra
-                | Provider::Engy
-                | Provider::Kubetee
-                | Provider::Moonmath
-                | Provider::Near
-        ) {
+        if sourcing_providers().contains(provider) {
             let declared_models = declared_models_for_provider(declared, provider);
             if !declared_models.is_empty() {
                 models.insert(provider.clone(), declared_models);
@@ -380,18 +569,19 @@ fn resolve_probe_models(
             continue;
         }
 
-        if let Some(canonical) = canonical.get(provider).cloned() {
-            let upstream = declared
-                .get(&(provider.clone(), canonical.clone()))
-                .and_then(|offer| offer.upstream_model.clone());
-            models.insert(
-                provider.clone(),
-                vec![ProbeModel {
-                    canonical,
-                    upstream,
+        if let Some(canonical_models) = canonical.get(provider) {
+            let provider_models = canonical_models
+                .iter()
+                .map(|canonical| ProbeModel {
+                    canonical: canonical.clone(),
+                    upstream: declared
+                        .get(&(provider.clone(), canonical.clone()))
+                        .filter(|offer| offer.is_offered)
+                        .and_then(|offer| offer.upstream_model.clone()),
                     fallback: false,
-                }],
-            );
+                })
+                .collect();
+            models.insert(provider.clone(), provider_models);
         }
     }
     ProbeModels { models }
@@ -401,7 +591,7 @@ fn resolve_probe_models(
 async fn fetch_canonical_models(
     cfg: &Config,
     providers: &[Provider],
-) -> std::collections::HashMap<Provider, String> {
+) -> std::collections::HashMap<Provider, Vec<String>> {
     let url = format!("{}/products", cfg.api_url());
     let catalog = match build_http_client() {
         Ok(client) => match client.get(&url).send().await {
@@ -416,12 +606,16 @@ async fn fetch_canonical_models(
     let mut models = std::collections::HashMap::new();
     if let Some(catalog) = catalog {
         for provider in providers {
-            if let Some(product) = catalog
+            let provider_models: Vec<_> = catalog
                 .products
                 .iter()
-                .find(|product| product.provider == provider.as_str() && product.status == "active")
-            {
-                models.insert(provider.clone(), product.model.clone());
+                .filter(|product| {
+                    product.provider == provider.as_str() && product.status == "active"
+                })
+                .map(|product| product.model.clone())
+                .collect();
+            if !provider_models.is_empty() {
+                models.insert(provider.clone(), provider_models);
             }
         }
     }
@@ -516,11 +710,12 @@ fn fallback_model(provider: &Provider) -> &'static str {
     }
 }
 
-fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
+fn build_probe(provider: Provider, model: &ProbeModel, slot: Option<String>) -> ProviderProbe {
     match provider {
         Provider::Anthropic => ProviderProbe {
             provider,
             model: model.canonical.clone(),
+            slot,
             fallback: model.fallback,
             path: "/v1/messages",
             body: serde_json::json!({
@@ -531,7 +726,7 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
             }),
         },
         Provider::Gemini => {
-            openai_compatible_probe(provider, model, "/v1beta/openai/chat/completions")
+            openai_compatible_probe(provider, model, slot, "/v1beta/openai/chat/completions")
         }
         Provider::OpenAI
         | Provider::Chutes
@@ -542,18 +737,22 @@ fn build_probe(provider: Provider, model: &ProbeModel) -> ProviderProbe {
         | Provider::Engy
         | Provider::Moonmath
         | Provider::Near
-        | Provider::Benchmark => openai_compatible_probe(provider, model, "/v1/chat/completions"),
+        | Provider::Benchmark => {
+            openai_compatible_probe(provider, model, slot, "/v1/chat/completions")
+        }
     }
 }
 
 fn openai_compatible_probe(
     provider: Provider,
     model: &ProbeModel,
+    slot: Option<String>,
     path: &'static str,
 ) -> ProviderProbe {
     ProviderProbe {
         provider,
         model: model.canonical.clone(),
+        slot,
         fallback: model.fallback,
         path,
         body: serde_json::json!({
@@ -588,6 +787,7 @@ async fn run_provider_probe(
             .context("NEAR probe has no upstream source model")?;
         request = request.header("x-gm-upstream-model", selector);
     }
+    request = apply_upstream_slot(request, probe.slot.as_deref());
     let mut response = request
         .json(&probe.body)
         .send()
@@ -610,6 +810,16 @@ async fn run_provider_probe(
         parser.push_chunk(&chunk, offset);
     }
     Ok(parser.finish())
+}
+
+fn apply_upstream_slot(
+    request: reqwest::RequestBuilder,
+    slot: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match slot {
+        Some(slot) => request.header("x-gm-upstream-slot", slot),
+        None => request,
+    }
 }
 
 fn endpoint_url(endpoint: &str, path: &str) -> Result<Url> {
@@ -866,7 +1076,7 @@ mod tests {
             upstream: Some("us.anthropic.claude-sonnet-4-6-v1".to_owned()),
             fallback: false,
         };
-        let probe = build_probe(Provider::Anthropic, &model);
+        let probe = build_probe(Provider::Anthropic, &model, None);
         assert_eq!(
             probe.body["model"],
             Value::String("us.anthropic.claude-sonnet-4-6-v1".to_owned())
@@ -881,7 +1091,7 @@ mod tests {
             upstream: None,
             fallback: false,
         };
-        let probe = build_probe(Provider::OpenAI, &model);
+        let probe = build_probe(Provider::OpenAI, &model, None);
         assert_eq!(probe.body["model"], Value::String("gpt-5.5".to_owned()));
         assert_eq!(probe.model, "gpt-5.5");
     }
@@ -893,7 +1103,7 @@ mod tests {
             upstream: None,
             fallback: true,
         };
-        let probe = build_probe(Provider::Zai, &model);
+        let probe = build_probe(Provider::Zai, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
         assert_eq!(probe.model, "glm-5.2");
@@ -906,7 +1116,7 @@ mod tests {
             upstream: None,
             fallback: true,
         };
-        let probe = build_probe(Provider::Kubetee, &model);
+        let probe = build_probe(Provider::Kubetee, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(
             probe.body["model"],
@@ -968,7 +1178,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].canonical, "z-ai/glm-5.2");
         assert!(models[0].fallback);
-        let probe = build_probe(Provider::Kubetee, &models[0]);
+        let probe = build_probe(Provider::Kubetee, &models[0], None);
         assert_eq!(probe.model_label(), "z-ai/glm-5.2 [fallback]");
     }
 
@@ -1163,7 +1373,7 @@ mod tests {
             );
         }
         let canonical =
-            std::collections::HashMap::from([(Provider::Kubetee, "z-ai/glm-5.2".to_owned())]);
+            std::collections::HashMap::from([(Provider::Kubetee, vec!["z-ai/glm-5.2".to_owned()])]);
 
         let catalog = resolve_probe_models(&[Provider::Kubetee], &canonical, &declared);
         let models = catalog.models_for(&Provider::Kubetee);
@@ -1181,7 +1391,7 @@ mod tests {
             upstream: None,
             fallback: true,
         };
-        let probe = build_probe(Provider::DeepInfra, &model);
+        let probe = build_probe(Provider::DeepInfra, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(
             probe.body["model"],
@@ -1197,7 +1407,7 @@ mod tests {
             upstream: None,
             fallback: true,
         };
-        let probe = build_probe(Provider::Moonmath, &model);
+        let probe = build_probe(Provider::Moonmath, &model, None);
         assert_eq!(probe.path, "/v1/chat/completions");
         assert_eq!(probe.body["model"], Value::String("glm-5.2".to_owned()));
         assert_eq!(probe.model, "glm-5.2");
@@ -1237,6 +1447,13 @@ mod tests {
         }
     }
 
+    fn unscoped_coverage(models: &[&str]) -> ProviderModelCoverage {
+        ProviderModelCoverage {
+            unscoped: models.iter().map(|model| (*model).to_owned()).collect(),
+            by_slot: HashMap::new(),
+        }
+    }
+
     /// Regression: local position 0 was a worker deregistered from the
     /// registry weeks ago, while the actual live worker sat at local
     /// position 2. `check-streaming` must probe the live one, not whatever
@@ -1267,6 +1484,323 @@ mod tests {
 
         let target = pick_target_worker(&local, &live).expect("resolves the oldest live worker");
         assert_eq!(target.node_secret, "secret-01J0A");
+    }
+
+    #[test]
+    fn selected_worker_limits_probes_to_its_provider_slots() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Engy,
+                unscoped_coverage(&["qwen3.8-27b"]),
+            )])),
+            requires_upstream_model: HashSet::new(),
+        };
+        let providers = providers_for_target(
+            &[Provider::DeepInfra, Provider::Engy, Provider::OpenAI],
+            &target,
+        );
+        assert_eq!(providers, [Provider::Engy]);
+    }
+
+    #[test]
+    fn target_worker_carries_registry_provider_slot_ownership() {
+        let local = vec![local_record("01J0A")];
+        let mut worker = live_worker("01J0A", "2026-07-01T00:00:00Z");
+        worker.supported_models = serde_json::from_value(serde_json::json!({
+            "deepinfra": ["Qwen/Qwen3.8-27B"]
+        }))
+        .expect("supported models");
+        worker.provider_slot_status = serde_json::from_value(serde_json::json!({
+            "engy": {"default": {"status": "verified", "models": ["qwen3.8-27b"]}}
+        }))
+        .expect("provider slots");
+
+        let target = pick_target_worker(&local, &[worker]).expect("target");
+        assert_eq!(
+            target.provider_models,
+            Some(HashMap::from([
+                (
+                    Provider::DeepInfra,
+                    unscoped_coverage(&["Qwen/Qwen3.8-27B"])
+                ),
+                (
+                    Provider::Engy,
+                    ProviderModelCoverage {
+                        unscoped: BTreeSet::new(),
+                        by_slot: HashMap::from([(
+                            "default".to_owned(),
+                            BTreeSet::from(["qwen3.8-27b".to_owned()]),
+                        )]),
+                    }
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn selected_worker_probes_only_its_exact_models() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Engy,
+                unscoped_coverage(&["qwen3.8-27b"]),
+            )])),
+            requires_upstream_model: HashSet::new(),
+        };
+        let models = vec![
+            ProbeModel {
+                canonical: "qwen3.6-35b-a3b".to_owned(),
+                upstream: None,
+                fallback: false,
+            },
+            ProbeModel {
+                canonical: "qwen3.8-27b".to_owned(),
+                upstream: None,
+                fallback: false,
+            },
+        ];
+
+        let selected = models_for_target(&target, &Provider::Engy, models).expect("known models");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model.canonical, "qwen3.8-27b");
+        assert_eq!(selected[0].slot, None);
+    }
+
+    #[test]
+    fn selected_worker_keeps_each_model_bound_to_its_verified_slot() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Engy,
+                ProviderModelCoverage {
+                    unscoped: BTreeSet::from([
+                        "qwen3.6-35b-a3b".to_owned(),
+                        "qwen3.8-27b".to_owned(),
+                    ]),
+                    by_slot: HashMap::from([
+                        (
+                            "slot-a".to_owned(),
+                            BTreeSet::from(["qwen3.6-35b-a3b".to_owned()]),
+                        ),
+                        (
+                            "slot-b".to_owned(),
+                            BTreeSet::from(["qwen3.8-27b".to_owned()]),
+                        ),
+                    ]),
+                },
+            )])),
+            requires_upstream_model: HashSet::new(),
+        };
+        let models = vec![
+            ProbeModel {
+                canonical: "qwen3.6-35b-a3b".to_owned(),
+                upstream: None,
+                fallback: false,
+            },
+            ProbeModel {
+                canonical: "qwen3.8-27b".to_owned(),
+                upstream: None,
+                fallback: false,
+            },
+        ];
+
+        let selected = models_for_target(&target, &Provider::Engy, models).expect("coverage");
+        let bindings: Vec<_> = selected
+            .iter()
+            .map(|selected| (selected.model.canonical.as_str(), selected.slot.as_deref()))
+            .collect();
+        assert_eq!(
+            bindings,
+            [
+                ("qwen3.6-35b-a3b", Some("slot-a")),
+                ("qwen3.8-27b", Some("slot-b")),
+            ]
+        );
+
+        let probe = build_probe(Provider::Engy, &selected[1].model, selected[1].slot.clone());
+        let request = apply_upstream_slot(
+            reqwest::Client::new().post("https://worker.example.org/v1/chat/completions"),
+            probe.slot.as_deref(),
+        )
+        .build()
+        .expect("request");
+        assert_eq!(request.headers()["x-gm-upstream-slot"], "slot-b");
+    }
+
+    #[test]
+    fn legacy_aggregate_models_with_unmapped_slots_are_inconclusive() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Engy,
+                ProviderModelCoverage {
+                    unscoped: BTreeSet::from([
+                        "qwen3.6-35b-a3b".to_owned(),
+                        "qwen3.8-27b".to_owned(),
+                    ]),
+                    by_slot: HashMap::from([
+                        ("slot-a".to_owned(), BTreeSet::new()),
+                        ("slot-b".to_owned(), BTreeSet::new()),
+                    ]),
+                },
+            )])),
+            requires_upstream_model: HashSet::new(),
+        };
+        let models = vec![ProbeModel {
+            canonical: "qwen3.8-27b".to_owned(),
+            upstream: None,
+            fallback: false,
+        }];
+
+        assert!(models_for_target(&target, &Provider::Engy, models).is_none());
+    }
+
+    #[test]
+    fn direct_provider_intersects_all_catalog_models_before_selecting() {
+        let canonical = HashMap::from([(
+            Provider::OpenAI,
+            vec!["gpt-5.4".to_owned(), "gpt-5.6".to_owned()],
+        )]);
+        let declared = HashMap::from([
+            (
+                (Provider::OpenAI, "gpt-5.4".to_owned()),
+                DeclaredOffer {
+                    upstream_model: Some("withdrawn-deployment-gpt-54".to_owned()),
+                    is_offered: false,
+                },
+            ),
+            (
+                (Provider::OpenAI, "gpt-5.6".to_owned()),
+                DeclaredOffer {
+                    upstream_model: Some("deployment-gpt-56".to_owned()),
+                    is_offered: true,
+                },
+            ),
+        ]);
+        let catalog = resolve_probe_models(&[Provider::OpenAI], &canonical, &declared);
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::OpenAI,
+                unscoped_coverage(&["gpt-5.6"]),
+            )])),
+            requires_upstream_model: HashSet::from([Provider::OpenAI]),
+        };
+
+        let selected = models_for_target(
+            &target,
+            &Provider::OpenAI,
+            catalog.models_for(&Provider::OpenAI),
+        )
+        .expect("coverage");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model.canonical, "gpt-5.6");
+        assert_eq!(selected[0].model.wire_model(), "deployment-gpt-56");
+    }
+
+    #[test]
+    fn post_deploy_cloud_probe_selects_a_declared_deployment_not_catalog_first() {
+        let canonical = HashMap::from([(
+            Provider::OpenAI,
+            vec!["gpt-5.4".to_owned(), "gpt-5.6".to_owned()],
+        )]);
+        let declared = HashMap::from([(
+            (Provider::OpenAI, "gpt-5.6".to_owned()),
+            DeclaredOffer {
+                upstream_model: Some("deployment-gpt-56".to_owned()),
+                is_offered: true,
+            },
+        )]);
+        let catalog = resolve_probe_models(&[Provider::OpenAI], &canonical, &declared);
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: None,
+            requires_upstream_model: HashSet::from([Provider::OpenAI]),
+        };
+
+        let selected = models_for_target(
+            &target,
+            &Provider::OpenAI,
+            catalog.models_for(&Provider::OpenAI),
+        )
+        .expect("declared deployment");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model.canonical, "gpt-5.6");
+        assert_eq!(selected[0].model.wire_model(), "deployment-gpt-56");
+    }
+
+    #[test]
+    fn cloud_probe_without_declared_upstream_mapping_is_inconclusive() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::OpenAI,
+                unscoped_coverage(&["gpt-5.6"]),
+            )])),
+            requires_upstream_model: HashSet::from([Provider::OpenAI]),
+        };
+        let models = vec![ProbeModel {
+            canonical: "gpt-5.6".to_owned(),
+            upstream: None,
+            fallback: false,
+        }];
+
+        assert!(models_for_target(&target, &Provider::OpenAI, models).is_none());
+    }
+
+    #[test]
+    fn known_non_overlapping_worker_models_produce_an_empty_probe_set() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::from([(
+                Provider::Engy,
+                unscoped_coverage(&["qwen3.8-27b"]),
+            )])),
+            requires_upstream_model: HashSet::new(),
+        };
+        let fallback = vec![ProbeModel {
+            canonical: "glm-5.2".to_owned(),
+            upstream: None,
+            fallback: true,
+        }];
+
+        let selected =
+            models_for_target(&target, &Provider::Engy, fallback).expect("known coverage");
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn unknown_worker_ownership_never_falls_back_to_current_config() {
+        let target = StreamingTarget {
+            endpoint: "https://worker.example.org".to_owned(),
+            node_secret: "secret".to_owned(),
+            provider_models: Some(HashMap::new()),
+            requires_upstream_model: HashSet::new(),
+        };
+        assert!(providers_for_target(&[Provider::Engy], &target).is_empty());
+    }
+
+    #[test]
+    fn declaration_outage_warning_covers_every_sourcing_provider() {
+        assert_eq!(
+            sourcing_providers(),
+            [
+                Provider::DeepInfra,
+                Provider::Engy,
+                Provider::Kubetee,
+                Provider::Moonmath,
+                Provider::Near,
+            ]
+        );
     }
 
     #[test]

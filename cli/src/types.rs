@@ -392,6 +392,10 @@ pub struct WorkerEntry {
     pub suspended_reprobe_attempt: u32,
     #[serde(default)]
     pub consecutive_ok: u32,
+    /// Provider -> exact model ids reported by the worker's latest successful
+    /// capability probe. Empty until that probe has completed.
+    #[serde(default)]
+    pub supported_models: BTreeMap<String, Vec<String>>,
     /// provider -> slot id -> verification state. The owner's key-health view:
     /// an `unverified` slot is an upstream key the registry could not use.
     #[serde(default)]
@@ -403,6 +407,10 @@ pub struct WorkerEntry {
 pub struct SlotStatus {
     #[serde(default)]
     pub status: Option<String>,
+    /// Exact models verified through this slot. Empty means the slot's model
+    /// coverage is unknown, not that it supports every declared offer.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Response from `GET /miners/{hotkey}/workers` (`WorkerListResponse`).

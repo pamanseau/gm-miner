@@ -24,7 +24,6 @@ explains the table and how to set each upstream up.
 | `moonshot/kimi-k3` | `deepinfra/moonshotai/Kimi-K3` | `api.deepinfra.com` | `--deepinfra` |
 | `engy/qwen3.6-35b-a3b` | `deepinfra/Qwen/Qwen3.6-35B-A3B` | `api.deepinfra.com` | `--deepinfra` |
 | `engy/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
-| `kubetee/deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `zai/glm-5.2` | `kubetee/z-ai/glm-5.2` | `llm.kubetee.ai` | `--kubetee` |
 | `moonshot/kimi-k3` | `kubetee/moonshotai/kimi-k3` | `llm.kubetee.ai` | `--kubetee` |
@@ -144,7 +143,6 @@ than the buyer pair; direct Engy Qwen products use their buyer pair:
 ```sh
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
-gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.8-27b --discount-pct 5
 gmcli declare-product --provider deepinfra --model zai-org/GLM-5.2 --discount-pct 5
