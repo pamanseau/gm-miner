@@ -57,9 +57,6 @@ explains the table and how to set each upstream up.
 | `google/gemma-4-31b-turbo-tee` | `near/google/gemma-4-31B-it` | `gemma-4-31b.completions.near.ai` | `--near` |
 | `qwen/qwen3.8-27b-tee` | `near/Qwen/Qwen3.8-27B` | `qwen3-8-27b.completions.near.ai` | `--near` |
 
-`kubetee/z-ai/glm-5.3-flash` is declared ahead of KubeTEE listing
-GLM-5.3-Flash; declare it once the model appears in KubeTEE's catalog.
-
 Source pairs that differ from their buyer are absent from the public catalog:
 they are dispatch targets, not products a buyer can request by name. The
 `gmcli sources` uses `GET /miners/products/routes` and lists every explicit
