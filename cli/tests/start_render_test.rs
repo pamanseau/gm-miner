@@ -65,6 +65,39 @@ fn direct_unset_render_matches_pinned_output() {
 }
 
 #[test]
+fn gemini_route_keeps_native_generate_content_path_verbatim() {
+    // The image SKUs use Google's native
+    // /v1beta/models/{model}:generateContent endpoint. The route is
+    // intentionally path-agnostic so both that endpoint and the existing
+    // OpenAI-compatible Gemini surface reach the same upstream unchanged.
+    // This render-only test never contacts Google and cannot generate a paid
+    // image; it guards the Envoy shape and the absence of a rewrite that would
+    // turn a native request into a different API.
+    let (status, _, stderr, rendered) = render_envoy([("GOOGLE_API_KEY", "google-key")]);
+    assert!(status.success(), "render failed: {stderr}");
+    let route = rendered
+        .split_once("## ── Gemini")
+        .and_then(|(_, rest)| rest.split_once("## ── NEAR direct confidential inference"))
+        .map_or_else(|| rendered.clone(), |(block, _)| block.to_owned());
+    assert!(
+        route.contains("prefix: \"/\""),
+        "Gemini must accept native /v1beta/models/...:generateContent paths"
+    );
+    assert!(route.contains("exact: \"gemini\""));
+    assert!(route.contains("cluster: gemini"));
+    assert!(
+        !route.contains("regex_rewrite") && !route.contains("path:"),
+        "native generateContent requests must not be rewritten"
+    );
+    assert!(rendered.contains("host_rewrite_literal: generativelanguage.googleapis.com"));
+    assert!(rendered.contains("sni: generativelanguage.googleapis.com"));
+    assert!(
+        !rendered.contains("google-key"),
+        "the key must never be rendered"
+    );
+}
+
+#[test]
 fn engy_route_keeps_v1_path_and_pins_the_wildcard_san() {
     // api.engy.ai serves the OpenAI-compatible surface under /v1 itself and
     // negotiates h2 over ALPN, so it mirrors kubetee rather than deepinfra.

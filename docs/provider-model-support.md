@@ -28,6 +28,8 @@ published.
 | `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
+| `Gemini 3.1 Flash Lite Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-lite-image` (`--google`) — testnet declaration only |
+| `Gemini 3.1 Flash Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-image` (`--google`) — testnet declaration only |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
@@ -60,3 +62,25 @@ published.
 | `Qwen3.8 27B` | Engy: `engy/qwen3.8-27b` (`--engy`); DeepInfra: `deepinfra/Qwen/Qwen3.8-27B` (`--deepinfra`) |
 | `Qwen3.8 27B TEE` | NEAR confidential inference: `near/Qwen/Qwen3.8-27B` (`--near`) |
 | `Qwen3.8-Flash-Next` | KubeTEE: `kubetee/qwen/qwen3.8-flash-next` (`--kubetee`) |
+
+The two Gemini image SKUs use the native
+`POST /v1beta/models/{model}:generateContent` request shape. Envoy forwards
+that path and body unchanged to Google's Gemini API; there is no Interactions
+route in the MVP. Routine capability/health probes stay text-only and must not
+request image output, so a probe does not create a paid image.
+
+These are universal catalog definitions, but the miner CLI's network guard
+refuses a single image declaration on default/mainnet and omits both image
+rows from `declare-products` there. Pass `--network testnet` explicitly to
+declare either SKU. A funded comparison is available only as the deliberate
+`gmcli --network testnet image-canary` command; it checks
+`/v1/models?api_shape=generateContent` for both live eligible SKUs, sends one
+non-streaming native request per SKU with `candidateCount=1`, `imageSize=1K`,
+`responseModalities=["IMAGE"]`, and no `tools`/grounding, then prints model,
+request id, usage dimensions, settled nUSD, and optional before/after balance.
+The canary never prints its prompt, generated image, or either key. See
+[`image-canary.md`](image-canary.md).
+
+`gmcli check-streaming` also skips these native image SKUs because its
+streaming check targets the OpenAI-compatible SSE surface; it never sends an
+image-generation probe.

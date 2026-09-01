@@ -68,6 +68,22 @@ they are dispatch targets, not products a buyer can request by name. The
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
 
+### Gemini image products (testnet only)
+
+`gemini/gemini-3.1-flash-lite-image` and
+`gemini/gemini-3.1-flash-image` are buyer products served through Google's
+native `generateContent` API. Set the Google provider key with
+`gmcli set-api-keys --google ...`, deploy, and use an explicit
+`--network testnet` when declaring either product. The catalog rows remain
+visible on every network so pricing and status can decode their image input
+and output dimensions, but mainnet `declare-product` refuses them and
+mainnet `declare-products` skips them.
+
+The provider key is not a buyer key. To deliberately verify the two native
+routes, use the paid [testnet image canary](image-canary.md), which requires a
+funded testnet GM buyer key and reconciles the two settled charges. It is not a
+worker health probe and is never run by `gmcli check-streaming`.
+
 ### Cloud transport variants
 
 Three backend transports are selected per worker rather than declared as separate products,
@@ -99,8 +115,8 @@ your rate per Mtok = buyer_retail[dimension] x (10000 - discount_bp) / 10000
 ```
 
 The discount applies to every dimension the buyer product prices — input and
-output always, plus prompt-cache, audio and long-context rates where the model
-has them. So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out,
+output always, plus prompt-cache, audio, image and long-context rates where the
+model has them. So for `zai/glm-5.2` at a buyer retail of $1.40 in / $4.40 out,
 declaring any of its routes at `--discount-pct 5` pays you:
 
 ```
