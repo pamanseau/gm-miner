@@ -74,15 +74,18 @@ endpoint while reporting a registry that predates the complete route catalog.
 `gemini/gemini-3.1-flash-image` are buyer products served through Google's
 native `generateContent` API. Set the Google provider key with
 `gmcli set-api-keys --google ...`, deploy, and use an explicit
-`--network testnet` when declaring either product. The catalog rows remain
-visible on every network so pricing and status can decode their image input
-and output dimensions, but mainnet `declare-product` refuses them and
-mainnet `declare-products` skips them.
+`--network testnet` when declaring either product. Their definitions remain
+universal in CLI code so pricing, status, and older catalog payloads can
+decode their image input and output dimensions. Mainnet publication,
+discovery, and declaration are excluded for this rollout: mainnet
+`declare-product` refuses them and mainnet `declare-products` skips them.
 
 The provider key is not a buyer key. To deliberately verify the two native
 routes, use the paid [testnet image canary](image-canary.md), which requires a
-funded testnet GM buyer key and reconciles the two settled charges. It is not a
-worker health probe and is never run by `gmcli check-streaming`.
+funded testnet GM buyer key and captures response/balance reconciliation
+evidence for the two settled charges. It is not a worker health probe and is
+never run by `gmcli check-streaming`; validator, finalizer, and dashboard
+evidence is a separate GM runbook concern.
 
 ### Cloud transport variants
 

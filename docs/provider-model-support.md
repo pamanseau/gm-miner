@@ -69,17 +69,21 @@ that path and body unchanged to Google's Gemini API; there is no Interactions
 route in the MVP. Routine capability/health probes stay text-only and must not
 request image output, so a probe does not create a paid image.
 
-These are universal catalog definitions, but the miner CLI's network guard
-refuses a single image declaration on default/mainnet and omits both image
-rows from `declare-products` there. Pass `--network testnet` explicitly to
-declare either SKU. A funded comparison is available only as the deliberate
+These definitions are universal in CLI code, but mainnet publication,
+discovery, and declaration are excluded for this rollout. The miner CLI's
+network guard refuses a single image declaration on default/mainnet and
+omits both image rows from `declare-products` there. Pass `--network testnet`
+explicitly to declare either SKU. A funded comparison is available only as
+the deliberate
 `gmcli --network testnet image-canary` command; it checks
 `/v1/models?api_shape=generateContent` for both live eligible SKUs, sends one
 non-streaming native request per SKU with `candidateCount=1`, `imageSize=1K`,
 `responseModalities=["IMAGE"]`, and no `tools`/grounding, then prints model,
 request id, usage dimensions, settled nUSD, and optional before/after balance.
-The canary never prints its prompt, generated image, or either key. See
-[`image-canary.md`](image-canary.md).
+The canary captures only response and balance reconciliation evidence;
+validator, finalizer, and dashboard evidence belongs to a separate GM
+runbook check. It never prints its prompt, generated image, or either key.
+See [`image-canary.md`](image-canary.md).
 
 `gmcli check-streaming` also skips these native image SKUs because its
 streaming check targets the OpenAI-compatible SSE surface; it never sends an

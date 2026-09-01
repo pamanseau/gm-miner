@@ -151,10 +151,13 @@ publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement
 The Gemini image-generation products `gemini-3.1-flash-lite-image` and
 `gemini-3.1-flash-image` use Google's native
 `POST /v1beta/models/{model}:generateContent` API. They are not OpenAI-compatible
-chat routes. The catalog definitions are present on both networks, but these
-two products are testnet-only for now: the default/mainnet
-`declare-product` refuses them and `declare-products` omits them. Select the
-network explicitly to declare them on testnet:
+chat routes. Their universal definitions remain in CLI code and the product
+vocabulary,
+so pricing, status, and older catalog payloads can decode every image
+dimension. Mainnet publication, discovery, and declaration are excluded for
+this rollout: the default/mainnet `declare-product` refuses them and
+`declare-products` omits them. Select the network explicitly to declare them
+on testnet:
 
 ```sh
 gmcli --network testnet declare-product \
@@ -164,9 +167,10 @@ gmcli --network testnet declare-product \
 Capability and health checks use a text-only Gemini request and do not generate
 a paid image. When you intentionally want to spend one small native image
 request per SKU on testnet, use the [Gemini image canary](docs/image-canary.md);
-it preflights both live eligible offers and prints only safe settlement fields.
-See the [provider support matrix](docs/provider-model-support.md) for the
-provider-side setup.
+it preflights both live eligible offers and prints only safe response/balance
+reconciliation evidence. Downstream validator, finalizer, and dashboard
+evidence is a separate GM runbook check. See the [provider support
+matrix](docs/provider-model-support.md) for the provider-side setup.
 
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
