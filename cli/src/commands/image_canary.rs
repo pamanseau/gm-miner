@@ -405,6 +405,7 @@ async fn send_image_probe(
     let usage = parse_usage_dimensions(&value).ok_or_else(|| {
         anyhow::anyhow!("native Gemini response for {model} had no usage metadata")
     })?;
+    validate_image_probe_response(&value, model, &usage)?;
     let settled_ndollars = parse_settled_ndollars(&value)
         .ok_or_else(|| anyhow::anyhow!("native Gemini response for {model} had no settled nUSD"))?;
     Ok(ImageCanaryObservation {
@@ -413,6 +414,62 @@ async fn send_image_probe(
         usage,
         settled_ndollars,
     })
+}
+
+fn validate_image_probe_response(
+    value: &Value,
+    model: &str,
+    usage: &UsageDimensions,
+) -> Result<()> {
+    if usage.image_output_tokens == 0 {
+        bail!("native Gemini response for {model} had no positive image output usage");
+    }
+    if !has_supported_non_empty_image(value) {
+        bail!("native Gemini response for {model} had no supported non-empty image candidate");
+    }
+    Ok(())
+}
+
+// Inspect only the native response shape and encoded-data presence. The
+// response Value, including any inline image string, is dropped with the
+// request after validation; no decoded image bytes are retained or printed.
+fn has_supported_non_empty_image(value: &Value) -> bool {
+    value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .is_some_and(|candidates| candidates.iter().any(candidate_has_image))
+}
+
+fn candidate_has_image(candidate: &Value) -> bool {
+    candidate
+        .get("content")
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+        .is_some_and(|parts| parts.iter().any(part_has_image))
+}
+
+fn part_has_image(part: &Value) -> bool {
+    let Some(inline_data) = part.get("inlineData").or_else(|| part.get("inline_data")) else {
+        return false;
+    };
+    let Some(mime_type) = inline_data
+        .get("mimeType")
+        .or_else(|| inline_data.get("mime_type"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(data) = inline_data.get("data").and_then(Value::as_str) else {
+        return false;
+    };
+    is_supported_image_mime(mime_type) && !data.trim().is_empty()
+}
+
+fn is_supported_image_mime(mime_type: &str) -> bool {
+    let Some((kind, subtype)) = mime_type.trim().split_once('/') else {
+        return false;
+    };
+    kind.eq_ignore_ascii_case("image") && !subtype.trim().is_empty()
 }
 
 async fn read_bounded_native_response(mut response: Response, model: &str) -> Result<Vec<u8>> {
@@ -668,6 +725,21 @@ mod tests {
         })
     }
 
+    fn native_text_response(model: &str, request_id: &str, settled_ndollars: u64) -> Value {
+        json!({
+            "responseId": request_id,
+            "modelVersion": model,
+            "candidates": [{"content": {"parts": [{"text": "I cannot provide that image."}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 0,
+                "totalTokenCount": 107,
+                "costNanoUsd": settled_ndollars
+            }
+        })
+    }
+
     async fn mount_native_responses(server: &MockServer, settled_ndollars: u64) {
         for (index, model) in GEMINI_IMAGE_MODELS.into_iter().enumerate() {
             mount_native_response(
@@ -696,6 +768,27 @@ mod tests {
                 ResponseTemplate::new(200)
                     .insert_header("x-gm-request-id", request_id)
                     .set_body_json(native_response(model, request_id, settled_ndollars)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_native_text_response(
+        server: &MockServer,
+        model: &str,
+        request_id: &str,
+        settled_ndollars: u64,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{GENERATE_CONTENT_PATH_PREFIX}{model}{GENERATE_CONTENT_ACTION}"
+            )))
+            .and(header("x-goog-api-key", "buyer-secret"))
+            .and(body_json(image_probe_body()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-gm-request-id", request_id)
+                    .set_body_json(native_text_response(model, request_id, settled_ndollars)),
             )
             .mount(server)
             .await;
@@ -904,6 +997,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_success_second_text_only_200_preserves_first_evidence() {
+        let server = MockServer::start().await;
+        mount_live_offers(&server, true).await;
+        mount_native_response(&server, GEMINI_IMAGE_MODELS[0], "first-request", 123).await;
+        mount_native_text_response(&server, GEMINI_IMAGE_MODELS[1], "refusal-request", 999).await;
+        mount_credit_sequence(&server, 10_000, 9_877).await;
+
+        let error = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
+            .await
+            .expect_err("a text-only 200 must fail the canary");
+        assert!(error.to_string().contains("partial failure"));
+        let partial = error
+            .downcast_ref::<PartialCanaryFailure>()
+            .expect("partial result retains successful evidence");
+        assert_eq!(partial.reports.len(), 1);
+        assert_eq!(partial.reports[0].model, GEMINI_IMAGE_MODELS[0]);
+        assert_eq!(partial.reports[0].request_id, "first-request");
+        assert_eq!(partial.reports[0].settled_ndollars, 123);
+        assert_eq!(partial.reports[0].reconciliation, "partial");
+    }
+
+    #[tokio::test]
+    async fn first_text_only_200_second_success_preserves_second_evidence() {
+        let server = MockServer::start().await;
+        mount_live_offers(&server, true).await;
+        mount_native_text_response(&server, GEMINI_IMAGE_MODELS[0], "refusal-request", 999).await;
+        mount_native_response(&server, GEMINI_IMAGE_MODELS[1], "second-request", 456).await;
+        mount_credit_sequence(&server, 10_000, 9_544).await;
+
+        let error = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
+            .await
+            .expect_err("a text-only 200 must fail the canary");
+        assert!(error.to_string().contains("partial failure"));
+        let partial = error
+            .downcast_ref::<PartialCanaryFailure>()
+            .expect("partial result retains successful evidence");
+        assert_eq!(partial.reports.len(), 1);
+        assert_eq!(partial.reports[0].model, GEMINI_IMAGE_MODELS[1]);
+        assert_eq!(partial.reports[0].request_id, "second-request");
+        assert_eq!(partial.reports[0].settled_ndollars, 456);
+        assert_eq!(partial.reports[0].reconciliation, "partial");
+    }
+
+    #[tokio::test]
     async fn declared_oversized_native_response_is_rejected_before_body_read() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
@@ -1022,5 +1159,43 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, 41);
         assert_eq!(usage.total_tokens, 78);
         assert!(usage.reasoning_tokens > usage.output_tokens);
+    }
+
+    #[test]
+    fn image_validation_requires_non_empty_supported_inline_data() {
+        let mut value = native_response("gemini-3.1-flash-image", "request-1", 321);
+        let usage = parse_usage_dimensions(&value).expect("usage");
+        validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect("image response");
+
+        value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] = json!("   ");
+        let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect_err("empty image data");
+        assert!(error.to_string().contains("non-empty image"), "{error:?}");
+
+        value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] =
+            json!("encoded-image");
+        value["candidates"][0]["content"]["parts"][0]["inlineData"]["mimeType"] =
+            json!("text/plain");
+        let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect_err("non-image inline data");
+        assert!(
+            error.to_string().contains("supported non-empty image"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn image_validation_requires_positive_image_output_usage() {
+        let mut value = native_response("gemini-3.1-flash-image", "request-1", 321);
+        value["usageMetadata"]["candidatesTokensDetails"] =
+            json!([{"modality": "TEXT", "tokenCount": 1_680}]);
+        let usage = parse_usage_dimensions(&value).expect("usage");
+        let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect_err("missing image output usage");
+        assert!(
+            error.to_string().contains("positive image output usage"),
+            "{error:?}"
+        );
     }
 }

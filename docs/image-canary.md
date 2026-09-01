@@ -51,6 +51,13 @@ The fixed private probe asks for one `IMAGE` candidate at `imageSize: "1K"`
 not requested. The generated image and the probe prompt are never printed or
 written to disk.
 
+A `200` response is accepted only when it contains at least one non-empty
+image `inlineData` part under `candidates[].content.parts[]` and reports
+positive image-output usage. A text-only response, safety/refusal response,
+empty image part, or response with zero image-output usage fails the SKU and
+the canary exits non-zero. Any earlier successful SKU still emits its safe
+reconciliation line.
+
 For every successful, charged SKU, stdout contains one JSON object with only
 reconciliation data: `model`, gateway/provider `request_id`, all usage
 dimensions, `settled_ndollars` (nUSD), and
