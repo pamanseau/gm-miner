@@ -26,6 +26,7 @@ const GENERATE_CONTENT_ACTION: &str = ":generateContent";
 // malformed or unexpectedly large response cannot grow an unbounded Vec. A
 // normal 1K image response is well below this ceiling.
 const MAX_NATIVE_IMAGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GATEWAY_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 // This text is deliberately fixed and intentionally never appears in output,
 // logs, or an error. The canary proves native image forwarding and settlement;
@@ -50,13 +51,13 @@ pub(crate) async fn cmd_image_canary(
     let gateway_url = gateway_url.unwrap_or_else(|| network.default_gateway_url());
     let client = build_http_client()?;
     match run_image_canary_with_client(&client, gateway_url, buyer_api_key).await {
-        Ok(reports) => print_reports(&reports),
+        Ok(run) => print_run(&run),
         Err(error) => {
-            // A generation request can fail after an earlier SKU has already
-            // been charged. Preserve and print every safe success report before
-            // returning a non-zero result for the partial run.
+            // A generation request can fail after dispatch and still be
+            // charged. Preserve every safe per-attempt observation and the
+            // run-level balance reconciliation before returning non-zero.
             if let Some(partial) = error.downcast_ref::<PartialCanaryFailure>() {
-                print_reports(&partial.reports)?;
+                print_run(&partial.run)?;
                 return Err(anyhow::anyhow!(partial.message.clone()));
             }
             Err(error)
@@ -64,8 +65,8 @@ pub(crate) async fn cmd_image_canary(
     }
 }
 
-fn print_reports(reports: &[ImageCanaryReport]) -> Result<()> {
-    for report in reports {
+fn print_run(run: &ImageCanaryRun) -> Result<()> {
+    for report in &run.reports {
         // This is the complete output surface by design. In particular, do
         // not print the request/response body, prompt, image data, or key.
         println!(
@@ -73,16 +74,30 @@ fn print_reports(reports: &[ImageCanaryReport]) -> Result<()> {
             serde_json::to_string(report).context("serialize image canary report")?
         );
     }
+    println!(
+        "{}",
+        serde_json::to_string(&run.summary).context("serialize image canary summary")?
+    );
     Ok(())
 }
 
 /// A machine-readable, safe reconciliation line emitted after one SKU probe.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ImageCanaryReport {
+    pub(crate) record: &'static str,
     pub(crate) model: String,
-    pub(crate) request_id: String,
-    pub(crate) usage: UsageDimensions,
-    pub(crate) settled_ndollars: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) request_id: Option<String>,
+    pub(crate) outcome: &'static str,
+    pub(crate) billing_status: BillingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<UsageDimensions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) settled_ndollars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) balance_before_ndollars: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,11 +107,42 @@ pub(crate) struct ImageCanaryReport {
     /// balance moved down. During a partial run it is evidence for the whole
     /// run and must not be attributed to one SKU.
     pub(crate) balance_delta_ndollars: Option<u64>,
-    /// `ok` when both balance reads agree with all settled charges;
-    /// `unavailable` when the gateway did not expose a readable balance;
-    /// `partial` when at least one SKU failed after another produced evidence;
-    /// `mismatch` when the observed balance does not reconcile.
+    /// `ok` when both balance reads agree with all known settled charges;
+    /// `unknown` when at least one dispatched probe has uncertain billing;
+    /// `unavailable` when the gateway did not expose a readable balance; or
+    /// `mismatch` when the observed balance contradicts known charges.
     pub(crate) reconciliation: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ImageCanarySummary {
+    pub(crate) record: &'static str,
+    pub(crate) successful_probes: usize,
+    pub(crate) failed_probes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) known_settled_ndollars: Option<u64>,
+    pub(crate) unknown_billing_probes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) balance_before_ndollars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) balance_after_ndollars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) balance_delta_ndollars: Option<u64>,
+    pub(crate) reconciliation: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageCanaryRun {
+    reports: Vec<ImageCanaryReport>,
+    summary: ImageCanarySummary,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BillingStatus {
+    Settled,
+    Unbilled,
+    Unknown,
 }
 
 /// The usage dimensions needed to audit an image request without exposing its
@@ -128,14 +174,18 @@ pub(crate) struct UsageDimensions {
 #[derive(Debug)]
 struct ImageCanaryObservation {
     model: String,
-    request_id: String,
-    usage: UsageDimensions,
-    settled_ndollars: u64,
+    request_id: Option<String>,
+    outcome: &'static str,
+    billing_status: BillingStatus,
+    http_status: Option<u16>,
+    usage: Option<UsageDimensions>,
+    settled_ndollars: Option<u64>,
+    failure: Option<String>,
 }
 
 #[derive(Debug)]
 struct PartialCanaryFailure {
-    reports: Vec<ImageCanaryReport>,
+    run: ImageCanaryRun,
     message: String,
 }
 
@@ -163,15 +213,11 @@ struct ModelAvailability {
 /// The injectable core used by the wiremock tests and by the production
 /// command. Offer discovery happens before either balance or generation call,
 /// making a missing SKU a strict no-spend gate.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The canary keeps offer gating, both probes, and reconciliation in one transactional flow"
-)]
 async fn run_image_canary_with_client(
     client: &Client,
     gateway_url: &str,
     buyer_api_key: &str,
-) -> Result<Vec<ImageCanaryReport>> {
+) -> Result<ImageCanaryRun> {
     let gateway_url = gateway_url.trim_end_matches('/');
     if gateway_url.is_empty() {
         bail!("the Gemini image canary gateway URL cannot be empty");
@@ -186,23 +232,73 @@ async fn run_image_canary_with_client(
 
     let balance_before = fetch_balance(client, gateway_url, buyer_api_key).await;
     let mut observations = Vec::with_capacity(GEMINI_IMAGE_MODELS.len());
-    let mut failures = Vec::new();
     for model in GEMINI_IMAGE_MODELS {
-        match send_image_probe(client, gateway_url, buyer_api_key, model).await {
-            Ok(observation) => observations.push(observation),
-            Err(error) => failures.push(format!("{model}: {error}")),
-        }
+        observations.push(send_image_probe(client, gateway_url, buyer_api_key, model).await);
     }
     // Read the balance even when a provider request failed: it is still useful
     // to tell an operator whether a failed request consumed anything, and this
     // read is never an image/provider call.
     let balance_after = fetch_balance(client, gateway_url, buyer_api_key).await;
 
-    if !failures.is_empty() {
-        let reports =
-            reports_for_observations(observations, balance_before, balance_after, "partial");
+    let settled_total = observations
+        .iter()
+        .filter_map(|observation| observation.settled_ndollars)
+        .try_fold(0_u64, u64::checked_add);
+    let unknown_billing_probes = observations
+        .iter()
+        .filter(|observation| observation.billing_status == BillingStatus::Unknown)
+        .count();
+    let successful_probes = observations
+        .iter()
+        .filter(|observation| observation.outcome == "succeeded")
+        .count();
+    let failed_probes = observations.len().saturating_sub(successful_probes);
+    let reconciliation = match (settled_total, balance_before, balance_after) {
+        (None, _, _) => "mismatch",
+        (Some(known), Some(before), Some(after)) => match before.checked_sub(after) {
+            Some(observed) if observed < known => "mismatch",
+            Some(observed) if unknown_billing_probes > 0 && observed >= known => "unknown",
+            Some(observed) if observed == known => "ok",
+            None | Some(_) => "mismatch",
+        },
+        _ => "unavailable",
+    };
+    let run = run_for_observations(
+        observations,
+        balance_before,
+        balance_after,
+        reconciliation,
+        settled_total,
+        unknown_billing_probes,
+        successful_probes,
+        failed_probes,
+    );
+
+    if reconciliation == "mismatch" {
+        let message = match (settled_total, balance_before, balance_after) {
+            (None, _, _) => {
+                "Gemini image canary reconciliation mismatch: settled amount overflowed".to_owned()
+            }
+            (Some(known), Some(before), Some(after)) => format!(
+                "Gemini image canary reconciliation mismatch: known settled charges total {known} nUSD, balance changed from {before} to {after} nUSD"
+            ),
+            _ => "Gemini image canary reconciliation mismatch".to_owned(),
+        };
+        return Err(PartialCanaryFailure { run, message }.into());
+    }
+    if failed_probes > 0 {
+        let failures = run
+            .reports
+            .iter()
+            .filter_map(|report| {
+                report
+                    .failure
+                    .as_ref()
+                    .map(|failure| format!("{}: {failure}", report.model))
+            })
+            .collect::<Vec<_>>();
         return Err(PartialCanaryFailure {
-            reports,
+            run,
             message: format!(
                 "Gemini image canary partial failure: request failure(s): {}",
                 failures.join("; ")
@@ -210,101 +306,58 @@ async fn run_image_canary_with_client(
         }
         .into());
     }
-    if observations.len() != GEMINI_IMAGE_MODELS.len() {
-        return Err(PartialCanaryFailure {
-            reports: reports_for_observations(
-                observations,
-                balance_before,
-                balance_after,
-                "partial",
-            ),
-            message: "Gemini image canary partial failure: did not produce one result per SKU"
-                .to_owned(),
-        }
-        .into());
-    }
 
-    let Some(settled_total) = observations
-        .iter()
-        .map(|observation| observation.settled_ndollars)
-        .try_fold(0_u64, u64::checked_add)
-    else {
-        return Err(PartialCanaryFailure {
-            reports: reports_for_observations(
-                observations,
-                balance_before,
-                balance_after,
-                "mismatch",
-            ),
-            message: "Gemini image canary reconciliation mismatch: settled amount overflowed"
-                .to_owned(),
-        }
-        .into());
-    };
-    let reconciliation = match (balance_before, balance_after) {
-        (Some(before), Some(after)) => {
-            let Some(observed_debit) = before.checked_sub(after) else {
-                return Err(PartialCanaryFailure {
-                    reports: reports_for_observations(
-                        observations,
-                        balance_before,
-                        balance_after,
-                        "mismatch",
-                    ),
-                    message: format!(
-                        "Gemini image canary reconciliation mismatch: balance increased from {before} to {after} nUSD while settled charges total {settled_total} nUSD"
-                    ),
-                }
-                .into());
-            };
-            if observed_debit != settled_total {
-                return Err(PartialCanaryFailure {
-                    reports: reports_for_observations(
-                        observations,
-                        balance_before,
-                        balance_after,
-                        "mismatch",
-                    ),
-                    message: format!(
-                        "Gemini image canary reconciliation mismatch: settled charges total {settled_total} nUSD, balance decreased by {observed_debit} nUSD"
-                    ),
-                }
-                .into());
-            }
-            "ok"
-        }
-        _ => "unavailable",
-    };
-
-    Ok(reports_for_observations(
-        observations,
-        balance_before,
-        balance_after,
-        reconciliation,
-    ))
+    Ok(run)
 }
 
-fn reports_for_observations(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "All run-level reconciliation values are assembled at one output boundary"
+)]
+fn run_for_observations(
     observations: Vec<ImageCanaryObservation>,
     balance_before: Option<u64>,
     balance_after: Option<u64>,
     reconciliation: &'static str,
-) -> Vec<ImageCanaryReport> {
+    known_settled_ndollars: Option<u64>,
+    unknown_billing_probes: usize,
+    successful_probes: usize,
+    failed_probes: usize,
+) -> ImageCanaryRun {
     let balance_delta_ndollars =
         balance_before.and_then(|before| balance_after.and_then(|after| before.checked_sub(after)));
-    observations
+    let reports = observations
         .into_iter()
         .map(|observation| ImageCanaryReport {
+            record: "probe",
             model: observation.model,
             request_id: observation.request_id,
+            outcome: observation.outcome,
+            billing_status: observation.billing_status,
+            http_status: observation.http_status,
             usage: observation.usage,
             settled_ndollars: observation.settled_ndollars,
+            failure: observation.failure,
             balance_before_ndollars: balance_before,
             balance_after_ndollars: balance_after,
             balance_delta_ndollars,
             reconciliation,
         })
-        .collect()
+        .collect();
+    ImageCanaryRun {
+        reports,
+        summary: ImageCanarySummary {
+            record: "summary",
+            successful_probes,
+            failed_probes,
+            known_settled_ndollars,
+            unknown_billing_probes,
+            balance_before_ndollars: balance_before,
+            balance_after_ndollars: balance_after,
+            balance_delta_ndollars,
+            reconciliation,
+        },
+    }
 }
 
 fn ensure_testnet(network: Network) -> Result<()> {
@@ -364,22 +417,35 @@ async fn fetch_balance(client: &Client, gateway_url: &str, buyer_api_key: &str) 
     value_u64(balance, &["nano_usd", "nanoUsd"])
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "The probe keeps the bounded response and billing evidence lifecycle explicit"
+)]
 async fn send_image_probe(
     client: &Client,
     gateway_url: &str,
     buyer_api_key: &str,
     model: &str,
-) -> Result<ImageCanaryObservation> {
+) -> ImageCanaryObservation {
     let url =
         format!("{gateway_url}{GENERATE_CONTENT_PATH_PREFIX}{model}{GENERATE_CONTENT_ACTION}");
-    let response = client
+    let Ok(mut response) = client
         .post(url)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-goog-api-key", buyer_api_key)
         .json(&image_probe_body())
         .send()
         .await
-        .with_context(|| format!("POST native Gemini generateContent for {model}"))?;
+    else {
+        return failed_observation(
+            model,
+            None,
+            None,
+            BillingStatus::Unknown,
+            None,
+            "transport error",
+        );
+    };
     let status = response.status();
     let request_id_header = response
         .headers()
@@ -388,33 +454,133 @@ async fn send_image_probe(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
     if !status.is_success() {
-        // Do not read or include the body. Provider/gateway error payloads are
-        // not part of this safe reconciliation surface.
-        bail!("native Gemini generateContent for {model} failed ({status})");
+        // The gateway's error envelope contains safe billing metadata. Read it
+        // under a small bound, retain only the allowlisted fields below, and
+        // discard the provider/gateway error object itself.
+        let (billing_status, settled_ndollars) = read_gateway_failure_billing(&mut response, model)
+            .await
+            .unwrap_or((BillingStatus::Unknown, None));
+        return failed_observation(
+            model,
+            request_id_header,
+            Some(status.as_u16()),
+            billing_status,
+            settled_ndollars,
+            &format!("HTTP {}", status.as_u16()),
+        );
     }
-    let body = read_bounded_native_response(response, model).await?;
-    let value: Value = serde_json::from_slice(&body)
-        .with_context(|| format!("parse native Gemini response for {model}"))?;
-    let request_id = request_id_header
-        .or_else(|| {
-            value
-                .get("responseId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .ok_or_else(|| anyhow::anyhow!("native Gemini response for {model} had no request ID"))?;
-    let usage = parse_usage_dimensions(&value).ok_or_else(|| {
-        anyhow::anyhow!("native Gemini response for {model} had no usage metadata")
-    })?;
-    validate_image_probe_response(&value, model, &usage)?;
-    let settled_ndollars = parse_settled_ndollars(&value)
-        .ok_or_else(|| anyhow::anyhow!("native Gemini response for {model} had no settled nUSD"))?;
-    Ok(ImageCanaryObservation {
+    let Ok(body) =
+        read_bounded_response(&mut response, model, MAX_NATIVE_IMAGE_RESPONSE_BYTES).await
+    else {
+        return failed_observation(
+            model,
+            request_id_header,
+            Some(status.as_u16()),
+            BillingStatus::Unknown,
+            None,
+            "invalid or oversized success response",
+        );
+    };
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return failed_observation(
+                model,
+                request_id_header,
+                Some(status.as_u16()),
+                BillingStatus::Unknown,
+                None,
+                "invalid success response",
+            );
+        }
+    };
+    let request_id = request_id_header.or_else(|| {
+        value
+            .get("responseId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let usage = parse_usage_dimensions(&value);
+    let settled_ndollars = parse_settled_ndollars(&value);
+    let failure = if request_id.is_none() {
+        Some("success response had no request ID")
+    } else if usage.is_none() {
+        Some("success response had no usage metadata")
+    } else if usage
+        .as_ref()
+        .is_some_and(|usage| validate_image_probe_response(&value, model, usage).is_err())
+    {
+        Some("success response had no valid image candidate")
+    } else if settled_ndollars.is_none() {
+        Some("success response had no settled nUSD")
+    } else {
+        None
+    };
+    if let Some(failure) = failure {
+        let billing_status = if settled_ndollars.is_some() {
+            BillingStatus::Settled
+        } else {
+            BillingStatus::Unknown
+        };
+        return failed_observation(
+            model,
+            request_id,
+            Some(status.as_u16()),
+            billing_status,
+            settled_ndollars,
+            failure,
+        );
+    }
+    ImageCanaryObservation {
         model: model.to_owned(),
         request_id,
+        outcome: "succeeded",
+        billing_status: BillingStatus::Settled,
+        http_status: Some(status.as_u16()),
         usage,
         settled_ndollars,
-    })
+        failure: None,
+    }
+}
+
+fn failed_observation(
+    model: &str,
+    request_id: Option<String>,
+    http_status: Option<u16>,
+    billing_status: BillingStatus,
+    settled_ndollars: Option<u64>,
+    failure: &str,
+) -> ImageCanaryObservation {
+    ImageCanaryObservation {
+        model: model.to_owned(),
+        request_id,
+        outcome: "failed",
+        billing_status,
+        http_status,
+        usage: None,
+        settled_ndollars,
+        failure: Some(failure.to_owned()),
+    }
+}
+
+async fn read_gateway_failure_billing(
+    response: &mut Response,
+    model: &str,
+) -> Result<(BillingStatus, Option<u64>)> {
+    let body = read_bounded_response(response, model, MAX_GATEWAY_ERROR_RESPONSE_BYTES).await?;
+    let value: Value = serde_json::from_slice(&body).context("parse gateway error envelope")?;
+    Ok(parse_gateway_failure_billing(&value))
+}
+
+fn parse_gateway_failure_billing(value: &Value) -> (BillingStatus, Option<u64>) {
+    match value.get("billing_status").and_then(Value::as_str) {
+        Some("settled") => match value_u64(value, &["cost_ndollars"]) {
+            Some(cost) => (BillingStatus::Settled, Some(cost)),
+            None => (BillingStatus::Unknown, None),
+        },
+        Some("unbilled") => (BillingStatus::Unbilled, None),
+        _ => (BillingStatus::Unknown, None),
+    }
 }
 
 fn validate_image_probe_response(
@@ -533,6 +699,7 @@ fn has_image_signature(format: SupportedImageFormat, bytes: &[u8]) -> bool {
     }
 }
 
+#[cfg(test)]
 async fn read_bounded_native_response(mut response: Response, model: &str) -> Result<Vec<u8>> {
     read_bounded_response(&mut response, model, MAX_NATIVE_IMAGE_RESPONSE_BYTES).await
 }
@@ -871,7 +1038,40 @@ mod tests {
             .and(body_json(image_probe_body()))
             .respond_with(
                 ResponseTemplate::new(500)
-                    .set_body_string("provider failure body must not be read"),
+                    .insert_header("x-gm-request-id", format!("{model}-failure"))
+                    .set_body_json(json!({
+                        "error": {"code": 500, "message": "provider failure"},
+                        "charged": false,
+                        "billing_status": "unbilled",
+                        "potentially_charged": false
+                    })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_billed_native_failure(
+        server: &MockServer,
+        model: &str,
+        request_id: &str,
+        settled_ndollars: u64,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{GENERATE_CONTENT_PATH_PREFIX}{model}{GENERATE_CONTENT_ACTION}"
+            )))
+            .and(header("x-goog-api-key", "buyer-secret"))
+            .and(body_json(image_probe_body()))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .insert_header("x-gm-request-id", request_id)
+                    .set_body_json(json!({
+                        "error": {"code": 422, "message": "content rejected"},
+                        "cost_ndollars": settled_ndollars,
+                        "charged": true,
+                        "billing_status": "settled",
+                        "potentially_charged": false
+                    })),
             )
             .mount(server)
             .await;
@@ -944,9 +1144,10 @@ mod tests {
         mount_native_responses(&server, 123).await;
         mount_credit_sequence(&server, 10_000, 9_754).await;
 
-        let reports = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
+        let run = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
             .await
             .expect("both image requests reconcile");
+        let reports = &run.reports;
         assert_eq!(reports.len(), 2);
         assert!(reports.iter().all(|report| report.reconciliation == "ok"));
         assert!(reports
@@ -955,11 +1156,14 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| report.balance_after_ndollars == Some(9_754)));
-        assert_eq!(reports[0].usage.image_input_tokens, 60);
-        assert_eq!(reports[0].usage.image_output_tokens, 1_600);
-        assert_eq!(reports[0].usage.tool_use_prompt_tokens, 13);
-        assert_eq!(reports[0].usage.total_tokens, 1_813);
-        assert_eq!(reports[0].settled_ndollars, 123);
+        let usage = reports[0].usage.as_ref().expect("successful usage");
+        assert_eq!(usage.image_input_tokens, 60);
+        assert_eq!(usage.image_output_tokens, 1_600);
+        assert_eq!(usage.tool_use_prompt_tokens, 13);
+        assert_eq!(usage.total_tokens, 1_813);
+        assert_eq!(reports[0].settled_ndollars, Some(123));
+        assert_eq!(run.summary.known_settled_ndollars, Some(246));
+        assert_eq!(run.summary.failed_probes, 0);
 
         let requests = server.received_requests().await.expect("requests");
         let native_requests: Vec<_> = requests
@@ -1000,15 +1204,18 @@ mod tests {
         let partial = error
             .downcast_ref::<PartialCanaryFailure>()
             .expect("mismatch retains safe evidence");
-        assert_eq!(partial.reports.len(), 2);
+        assert_eq!(partial.run.reports.len(), 2);
         assert!(partial
+            .run
             .reports
             .iter()
             .all(|report| report.reconciliation == "mismatch"));
         assert!(partial
+            .run
             .reports
             .iter()
             .all(|report| report.balance_delta_ndollars == Some(1)));
+        assert_eq!(partial.run.summary.reconciliation, "mismatch");
     }
 
     #[tokio::test]
@@ -1026,15 +1233,20 @@ mod tests {
         let partial = error
             .downcast_ref::<PartialCanaryFailure>()
             .expect("partial result retains successful evidence");
-        assert_eq!(partial.reports.len(), 1);
-        let report = &partial.reports[0];
+        assert_eq!(partial.run.reports.len(), 2);
+        let report = &partial.run.reports[0];
         assert_eq!(report.model, GEMINI_IMAGE_MODELS[0]);
-        assert_eq!(report.request_id, "first-request");
-        assert_eq!(report.settled_ndollars, 123);
+        assert_eq!(report.request_id.as_deref(), Some("first-request"));
+        assert_eq!(report.settled_ndollars, Some(123));
         assert_eq!(report.balance_before_ndollars, Some(10_000));
         assert_eq!(report.balance_after_ndollars, Some(9_877));
         assert_eq!(report.balance_delta_ndollars, Some(123));
-        assert_eq!(report.reconciliation, "partial");
+        assert_eq!(report.reconciliation, "ok");
+        let failed = &partial.run.reports[1];
+        assert_eq!(failed.outcome, "failed");
+        assert_eq!(failed.billing_status, BillingStatus::Unbilled);
+        assert_eq!(partial.run.summary.known_settled_ndollars, Some(123));
+        assert_eq!(partial.run.summary.failed_probes, 1);
         let safe = serde_json::to_string(report).expect("safe partial report");
         assert!(!safe.contains("provider-secret"));
         assert!(!safe.contains(TEST_IMAGE_BASE64));
@@ -1055,13 +1267,57 @@ mod tests {
         let partial = error
             .downcast_ref::<PartialCanaryFailure>()
             .expect("partial result retains successful evidence");
-        assert_eq!(partial.reports.len(), 1);
-        let report = &partial.reports[0];
+        assert_eq!(partial.run.reports.len(), 2);
+        let report = &partial.run.reports[1];
         assert_eq!(report.model, GEMINI_IMAGE_MODELS[1]);
-        assert_eq!(report.request_id, "second-request");
-        assert_eq!(report.settled_ndollars, 456);
+        assert_eq!(report.request_id.as_deref(), Some("second-request"));
+        assert_eq!(report.settled_ndollars, Some(456));
         assert_eq!(report.balance_delta_ndollars, Some(456));
-        assert_eq!(report.reconciliation, "partial");
+        assert_eq!(report.reconciliation, "ok");
+    }
+
+    #[tokio::test]
+    async fn failed_charged_probe_retains_billing_and_zero_success_run_summary() {
+        let server = MockServer::start().await;
+        mount_live_offers(&server, true).await;
+        mount_billed_native_failure(
+            &server,
+            GEMINI_IMAGE_MODELS[0],
+            "charged-failure-request",
+            321,
+        )
+        .await;
+        mount_native_failure(&server, GEMINI_IMAGE_MODELS[1]).await;
+        mount_credit_sequence(&server, 10_000, 9_679).await;
+
+        let error = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
+            .await
+            .expect_err("failed probes keep a non-zero command result");
+        let partial = error
+            .downcast_ref::<PartialCanaryFailure>()
+            .expect("failed probes retain reconciliation evidence");
+        assert_eq!(partial.run.reports.len(), 2);
+        let charged = &partial.run.reports[0];
+        assert_eq!(charged.outcome, "failed");
+        assert_eq!(charged.http_status, Some(422));
+        assert_eq!(
+            charged.request_id.as_deref(),
+            Some("charged-failure-request")
+        );
+        assert_eq!(charged.billing_status, BillingStatus::Settled);
+        assert_eq!(charged.settled_ndollars, Some(321));
+        assert_eq!(partial.run.summary.successful_probes, 0);
+        assert_eq!(partial.run.summary.failed_probes, 2);
+        assert_eq!(partial.run.summary.known_settled_ndollars, Some(321));
+        assert_eq!(partial.run.summary.unknown_billing_probes, 0);
+        assert_eq!(partial.run.summary.balance_delta_ndollars, Some(321));
+        assert_eq!(partial.run.summary.reconciliation, "ok");
+
+        let summary = serde_json::to_string(&partial.run.summary).expect("safe summary");
+        assert!(summary.contains("\"record\":\"summary\""));
+        assert!(summary.contains("\"known_settled_ndollars\":321"));
+        assert!(!summary.contains("content rejected"));
+        assert!(!summary.contains("buyer-secret"));
     }
 
     #[tokio::test]
@@ -1070,7 +1326,7 @@ mod tests {
         mount_live_offers(&server, true).await;
         mount_native_response(&server, GEMINI_IMAGE_MODELS[0], "first-request", 123).await;
         mount_native_text_response(&server, GEMINI_IMAGE_MODELS[1], "refusal-request", 999).await;
-        mount_credit_sequence(&server, 10_000, 9_877).await;
+        mount_credit_sequence(&server, 10_000, 8_878).await;
 
         let error = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
             .await
@@ -1079,11 +1335,16 @@ mod tests {
         let partial = error
             .downcast_ref::<PartialCanaryFailure>()
             .expect("partial result retains successful evidence");
-        assert_eq!(partial.reports.len(), 1);
-        assert_eq!(partial.reports[0].model, GEMINI_IMAGE_MODELS[0]);
-        assert_eq!(partial.reports[0].request_id, "first-request");
-        assert_eq!(partial.reports[0].settled_ndollars, 123);
-        assert_eq!(partial.reports[0].reconciliation, "partial");
+        assert_eq!(partial.run.reports.len(), 2);
+        assert_eq!(partial.run.reports[0].model, GEMINI_IMAGE_MODELS[0]);
+        assert_eq!(
+            partial.run.reports[0].request_id.as_deref(),
+            Some("first-request")
+        );
+        assert_eq!(partial.run.reports[0].settled_ndollars, Some(123));
+        assert_eq!(partial.run.reports[1].outcome, "failed");
+        assert_eq!(partial.run.reports[1].settled_ndollars, Some(999));
+        assert_eq!(partial.run.summary.reconciliation, "ok");
     }
 
     #[tokio::test]
@@ -1092,7 +1353,7 @@ mod tests {
         mount_live_offers(&server, true).await;
         mount_native_text_response(&server, GEMINI_IMAGE_MODELS[0], "refusal-request", 999).await;
         mount_native_response(&server, GEMINI_IMAGE_MODELS[1], "second-request", 456).await;
-        mount_credit_sequence(&server, 10_000, 9_544).await;
+        mount_credit_sequence(&server, 10_000, 8_545).await;
 
         let error = run_image_canary_with_client(&client(), &server.uri(), "buyer-secret")
             .await
@@ -1101,11 +1362,16 @@ mod tests {
         let partial = error
             .downcast_ref::<PartialCanaryFailure>()
             .expect("partial result retains successful evidence");
-        assert_eq!(partial.reports.len(), 1);
-        assert_eq!(partial.reports[0].model, GEMINI_IMAGE_MODELS[1]);
-        assert_eq!(partial.reports[0].request_id, "second-request");
-        assert_eq!(partial.reports[0].settled_ndollars, 456);
-        assert_eq!(partial.reports[0].reconciliation, "partial");
+        assert_eq!(partial.run.reports.len(), 2);
+        assert_eq!(partial.run.reports[1].model, GEMINI_IMAGE_MODELS[1]);
+        assert_eq!(
+            partial.run.reports[1].request_id.as_deref(),
+            Some("second-request")
+        );
+        assert_eq!(partial.run.reports[1].settled_ndollars, Some(456));
+        assert_eq!(partial.run.reports[0].outcome, "failed");
+        assert_eq!(partial.run.reports[0].settled_ndollars, Some(999));
+        assert_eq!(partial.run.summary.reconciliation, "ok");
     }
 
     #[tokio::test]
@@ -1186,10 +1452,15 @@ mod tests {
         assert_eq!(usage.total_tokens, 1_813);
         assert_eq!(parse_settled_ndollars(&value), Some(321));
         let report = ImageCanaryReport {
+            record: "probe",
             model: "gemini-3.1-flash-image".to_owned(),
-            request_id: "request-1".to_owned(),
-            usage,
-            settled_ndollars: 321,
+            request_id: Some("request-1".to_owned()),
+            outcome: "succeeded",
+            billing_status: BillingStatus::Settled,
+            http_status: Some(200),
+            usage: Some(usage),
+            settled_ndollars: Some(321),
+            failure: None,
             balance_before_ndollars: Some(1_000),
             balance_after_ndollars: Some(679),
             balance_delta_ndollars: Some(321),
