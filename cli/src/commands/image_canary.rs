@@ -8,6 +8,7 @@
 //! retaining or printing the generated image body.
 
 use anyhow::{bail, Context as _, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::{header, Client, Response};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -430,9 +431,19 @@ fn validate_image_probe_response(
     Ok(())
 }
 
-// Inspect only the native response shape and encoded-data presence. The
-// response Value, including any inline image string, is dropped with the
-// request after validation; no decoded image bytes are retained or printed.
+// Inspect the native response shape, decode one candidate only for bounded
+// signature validation, and drop those bytes before returning. The response
+// Value, including any inline image string, is never printed or retained in
+// the reconciliation report.
+#[derive(Clone, Copy)]
+enum SupportedImageFormat {
+    Png,
+    Jpeg,
+    Webp,
+    Avif,
+    Gif,
+}
+
 fn has_supported_non_empty_image(value: &Value) -> bool {
     value
         .get("candidates")
@@ -459,17 +470,67 @@ fn part_has_image(part: &Value) -> bool {
     else {
         return false;
     };
+    let Some(format) = supported_image_format(mime_type) else {
+        return false;
+    };
     let Some(data) = inline_data.get("data").and_then(Value::as_str) else {
         return false;
     };
-    is_supported_image_mime(mime_type) && !data.trim().is_empty()
-}
-
-fn is_supported_image_mime(mime_type: &str) -> bool {
-    let Some((kind, subtype)) = mime_type.trim().split_once('/') else {
+    if data.trim().is_empty() {
+        return false;
+    }
+    if data.len() > MAX_NATIVE_IMAGE_RESPONSE_BYTES {
+        return false;
+    }
+    let Ok(decoded_bytes) = BASE64_STANDARD.decode(data.trim()) else {
         return false;
     };
-    kind.eq_ignore_ascii_case("image") && !subtype.trim().is_empty()
+    let matches_signature = has_image_signature(format, &decoded_bytes);
+    drop(decoded_bytes);
+    matches_signature
+}
+
+// Keep this set aligned with the dashboard's image contract: the canary only
+// validates the provider payload and never stores or renders the decoded data.
+fn supported_image_format(mime_type: &str) -> Option<SupportedImageFormat> {
+    let mime_type = mime_type.trim();
+    if mime_type.eq_ignore_ascii_case("image/png") {
+        Some(SupportedImageFormat::Png)
+    } else if mime_type.eq_ignore_ascii_case("image/jpeg") {
+        Some(SupportedImageFormat::Jpeg)
+    } else if mime_type.eq_ignore_ascii_case("image/webp") {
+        Some(SupportedImageFormat::Webp)
+    } else if mime_type.eq_ignore_ascii_case("image/avif") {
+        Some(SupportedImageFormat::Avif)
+    } else if mime_type.eq_ignore_ascii_case("image/gif") {
+        Some(SupportedImageFormat::Gif)
+    } else {
+        None
+    }
+}
+
+fn has_image_signature(format: SupportedImageFormat, bytes: &[u8]) -> bool {
+    match format {
+        SupportedImageFormat::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        SupportedImageFormat::Jpeg => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        SupportedImageFormat::Webp => {
+            bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+        }
+        SupportedImageFormat::Avif => {
+            if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+                return false;
+            }
+            let major_brand = &bytes[8..12];
+            major_brand == b"avif"
+                || major_brand == b"avis"
+                || bytes[16..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|brand| brand == b"avif" || brand == b"avis")
+        }
+        SupportedImageFormat::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+    }
 }
 
 async fn read_bounded_native_response(mut response: Response, model: &str) -> Result<Vec<u8>> {
@@ -688,6 +749,9 @@ mod tests {
         build_http_client().expect("http client")
     }
 
+    const TEST_IMAGE_BASE64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
     async fn mount_live_offers(server: &MockServer, available: bool) {
         Mock::given(method("GET"))
             .and(path(MODELS_PATH))
@@ -705,7 +769,7 @@ mod tests {
         json!({
             "responseId": request_id,
             "modelVersion": model,
-            "candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "GENERATED_IMAGE_MUST_NOT_BE_PRINTED"}}]}}],
+            "candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": TEST_IMAGE_BASE64}}]}}],
             "usageMetadata": {
                 "promptTokenCount": 100,
                 "candidatesTokenCount": 1_680,
@@ -729,10 +793,14 @@ mod tests {
         json!({
             "responseId": request_id,
             "modelVersion": model,
-            "candidates": [{"content": {"parts": [{"text": "I cannot provide that image."}]}}],
+            "candidates": [{
+                "content": {"parts": [{"text": "I cannot provide that image."}]},
+                "finishReason": "SAFETY"
+            }],
             "usageMetadata": {
                 "promptTokenCount": 100,
                 "candidatesTokenCount": 7,
+                "imageOutputTokenCount": 1,
                 "thoughtsTokenCount": 0,
                 "totalTokenCount": 107,
                 "costNanoUsd": settled_ndollars
@@ -803,7 +871,7 @@ mod tests {
             .and(body_json(image_probe_body()))
             .respond_with(
                 ResponseTemplate::new(500)
-                    .set_body_string("provider-secret and GENERATED_IMAGE_MUST_NOT_BE_PRINTED"),
+                    .set_body_string("provider failure body must not be read"),
             )
             .mount(server)
             .await;
@@ -969,7 +1037,7 @@ mod tests {
         assert_eq!(report.reconciliation, "partial");
         let safe = serde_json::to_string(report).expect("safe partial report");
         assert!(!safe.contains("provider-secret"));
-        assert!(!safe.contains("GENERATED_IMAGE_MUST_NOT_BE_PRINTED"));
+        assert!(!safe.contains(TEST_IMAGE_BASE64));
     }
 
     #[tokio::test]
@@ -1131,7 +1199,7 @@ mod tests {
         assert!(output.contains("request-1"));
         assert!(output.contains("image_input_tokens"));
         assert!(output.contains("321"));
-        assert!(!output.contains("GENERATED_IMAGE_MUST_NOT_BE_PRINTED"));
+        assert!(!output.contains(TEST_IMAGE_BASE64));
         assert!(!output.contains(CANARY_PROMPT));
         assert!(!output.contains("buyer-secret"));
     }
@@ -1168,13 +1236,29 @@ mod tests {
         validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
             .expect("image response");
 
+        value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] = json!("not-base64!");
+        let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect_err("invalid base64 image data");
+        assert!(
+            error.to_string().contains("supported non-empty image"),
+            "{error:?}"
+        );
+
+        value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] = json!("aGVsbG8=");
+        let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
+            .expect_err("signature-mismatched image data");
+        assert!(
+            error.to_string().contains("supported non-empty image"),
+            "{error:?}"
+        );
+
         value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] = json!("   ");
         let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
             .expect_err("empty image data");
         assert!(error.to_string().contains("non-empty image"), "{error:?}");
 
         value["candidates"][0]["content"]["parts"][0]["inlineData"]["data"] =
-            json!("encoded-image");
+            json!(TEST_IMAGE_BASE64);
         value["candidates"][0]["content"]["parts"][0]["inlineData"]["mimeType"] =
             json!("text/plain");
         let error = validate_image_probe_response(&value, "gemini-3.1-flash-image", &usage)
@@ -1197,5 +1281,23 @@ mod tests {
             error.to_string().contains("positive image output usage"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn supported_image_signatures_match_the_dashboard_mime_set() {
+        let fixtures = [
+            (SupportedImageFormat::Png, TEST_IMAGE_BASE64),
+            (SupportedImageFormat::Jpeg, "/9j/4A=="),
+            (SupportedImageFormat::Webp, "UklGRgAAAABXRUJQ"),
+            (SupportedImageFormat::Avif, "AAAAAGZ0eXBhdmlmAAAAAA=="),
+            (SupportedImageFormat::Gif, "R0lGODlh"),
+        ];
+        for (format, encoded) in fixtures {
+            let bytes = BASE64_STANDARD.decode(encoded).expect("fixture base64");
+            assert!(
+                has_image_signature(format, &bytes),
+                "signature should match fixture {encoded}"
+            );
+        }
     }
 }
