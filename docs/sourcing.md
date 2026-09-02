@@ -68,17 +68,15 @@ they are dispatch targets, not products a buyer can request by name. The
 route, including self routes. It falls back to the older cross-product-only
 endpoint while reporting a registry that predates the complete route catalog.
 
-### Gemini image products (testnet only)
+### Gemini image products
 
 `gemini/gemini-3.1-flash-lite-image` and
 `gemini/gemini-3.1-flash-image` are buyer products served through Google's
 native `generateContent` API. Set the Google provider key with
-`gmcli set-api-keys --google ...`, deploy, and use an explicit
-`--network testnet` when declaring either product. Their definitions remain
-universal in CLI code so pricing, status, and older catalog payloads can
-decode their image input and output dimensions. Mainnet publication,
-discovery, and declaration are excluded for this rollout: mainnet
-`declare-product` refuses them and mainnet `declare-products` skips them.
+`gmcli set-api-keys --google ...`, deploy, and use an explicit `--network`
+when declaring either product. Their definitions are available on both
+networks so pricing, status, and catalog payloads can decode their image input
+and output dimensions.
 
 The provider key is not a buyer key. To deliberately verify the two native
 routes, use the paid [testnet image canary](image-canary.md), which requires a
