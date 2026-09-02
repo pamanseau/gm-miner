@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
-/// The two Gemini image-generation buyer products in the testnet-first MVP.
+/// The two Gemini image-generation buyer products.
 ///
 /// These identifiers are part of the universal product/catalog vocabulary:
 /// they remain deserialisable and renderable on every network. Network policy

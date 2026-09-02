@@ -10,10 +10,9 @@ gemini/gemini-3.1-flash-image
 
 It is not part of `gmcli doctor` or `gmcli check-streaming`. Routine worker
 health checks stay text-only so they cannot unexpectedly generate an image.
-The SKU definitions are universal in CLI code for pricing/status decoding, but
-mainnet publication, discovery, and declaration are excluded for this rollout;
-only explicit `--network testnet` declaration and this deliberate canary may
-use the image products.
+The SKU definitions, publication, discovery, and declaration are supported on
+both networks. The funded canary remains deliberately testnet-only so routine
+or mainnet operator commands cannot unexpectedly spend buyer credit.
 
 ## Run it
 

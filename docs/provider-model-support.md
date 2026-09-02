@@ -28,8 +28,8 @@ published.
 | `DeepSeek V4 Flash 0731` | KubeTEE: `kubetee/deepseek/deepseek-v4-flash-0731` (`--kubetee`); Engy: `engy/deepseek-v4-flash-0731` (`--engy`); DeepInfra: `deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731` (`--deepinfra`) |
 | `DeepSeek V4 Flash 0731 TEE` | Chutes: `chutes/deepseek-ai/DeepSeek-V4-Flash-0731-TEE` (`--chutes`); NEAR confidential inference: `near/deepseek-ai/DeepSeek-V4-Flash` (`--near`) |
 | `Gemma 4 31B Turbo TEE` | Chutes: `chutes/google/gemma-4-31B-turbo-TEE` (`--chutes`); NEAR confidential inference: `near/google/gemma-4-31B-it` (`--near`) |
-| `Gemini 3.1 Flash Lite Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-lite-image` (`--google`) — testnet declaration only |
-| `Gemini 3.1 Flash Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-image` (`--google`) — testnet declaration only |
+| `Gemini 3.1 Flash Lite Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-lite-image` (`--google`) |
+| `Gemini 3.1 Flash Image` | Google native `generateContent`: `gemini/gemini-3.1-flash-image` (`--google`) |
 | `Gemini 3.1 Pro Preview` | Google: `gemini/gemini-3.1-pro-preview` (`--google`) |
 | `Gemini 3.5 Flash` | Google: `gemini/gemini-3.5-flash` (`--google`) |
 | `GLM-5.1 TEE` | Chutes: `chutes/zai-org/GLM-5.1-TEE` (`--chutes`); NEAR confidential inference: `near/zai-org/GLM-5.1-FP8` (`--near`) |
@@ -69,12 +69,10 @@ that path and body unchanged to Google's Gemini API; there is no Interactions
 route in the MVP. Routine capability/health probes stay text-only and must not
 request image output, so a probe does not create a paid image.
 
-These definitions are universal in CLI code, but mainnet publication,
-discovery, and declaration are excluded for this rollout. The miner CLI's
-network guard refuses a single image declaration on default/mainnet and
-omits both image rows from `declare-products` there. Pass `--network testnet`
-explicitly to declare either SKU. A funded comparison is available only as
-the deliberate
+These definitions, publication, discovery, and declaration are supported on
+both networks. Pass `--network` explicitly when changing an image offer so the
+intended registry is unambiguous. A funded comparison is available only as the
+deliberate
 `gmcli --network testnet image-canary` command; it checks
 `/v1/models?api_shape=generateContent` for both live eligible SKUs, sends one
 non-streaming native request per SKU with `candidateCount=1`, `imageSize=1K`,

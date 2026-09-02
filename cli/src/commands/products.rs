@@ -4,11 +4,9 @@
 
 use anyhow::{bail, Context as _, Result};
 
-use gm_miner_cli::types::is_gemini_image_model;
 use gm_miner_cli::{
     client::RegistryClient,
     dependency::confirm,
-    network::Network,
     pricing::{
         effective_dimensions, effective_rate_summary, extra_dimension_lines, format_discount_pct,
         format_usd,
@@ -52,7 +50,6 @@ pub(crate) async fn cmd_declare_product(
     discount_bp: u32,
     args: DeclareArgs<'_>,
 ) -> Result<()> {
-    ensure_declaration_network(client.config.resolved_network(), provider, model)?;
     let catalog = fetch_catalog(client).await?;
     let catalog_hit = catalog
         .products
@@ -298,19 +295,6 @@ pub(crate) async fn cmd_declare_products(
         );
     }
     let mut targets = filter_catalog(&catalog.products, provider_filter);
-    let network = client.config.resolved_network();
-    let blocked_image_count = if network == Network::Mainnet {
-        targets
-            .iter()
-            .filter(|product| is_testnet_only_image_product(product))
-            .count()
-    } else {
-        0
-    };
-    if blocked_image_count > 0 {
-        targets.retain(|product| !is_testnet_only_image_product(product));
-        println!("Skipping {blocked_image_count} testnet-only Gemini image product(s) on mainnet.");
-    }
     targets.retain(|product| {
         routes.routes().iter().any(|route| {
             route.provider == product.provider.as_str()
@@ -321,12 +305,6 @@ pub(crate) async fn cmd_declare_products(
     });
 
     if targets.is_empty() {
-        if blocked_image_count > 0 {
-            bail!(
-                "Gemini image products are testnet-only and cannot be declared on mainnet; \
-                 pass `--network testnet` to declare them"
-            );
-        }
         let scope =
             provider_filter.map_or_else(|| "the catalog".to_owned(), |p| format!("provider {p}"));
         bail!("no active products found in {scope} to declare against");
@@ -645,27 +623,6 @@ pub(crate) fn filter_catalog<'a>(
         .filter(|p| p.provider != "benchmark")
         .filter(|p| provider_filter.is_none_or(|target| p.provider == target.as_str()))
         .collect()
-}
-
-/// The image SKUs are universal catalog entries, but their offers are
-/// deliberately testnet-only until the funded comparison canary has passed.
-/// Keep this policy at the declaration boundary: status/catalog rendering can
-/// still decode and display the products on either network.
-fn is_testnet_only_image_product(product: &Product) -> bool {
-    is_gemini_image_model(&product.provider, &product.model)
-}
-
-/// Refuse a single image declaration before any registry request. This keeps
-/// a typo-free but unsafe mainnet command from even fetching the catalog or
-/// reaching the POST endpoint; `--network testnet` is the explicit opt-in.
-fn ensure_declaration_network(network: Network, provider: &Provider, model: &str) -> Result<()> {
-    if network == Network::Mainnet && is_gemini_image_model(provider.as_str(), model) {
-        bail!(
-            "{provider}/{model} is testnet-only and cannot be declared on mainnet; \
-             pass `--network testnet` to declare it"
-        );
-    }
-    Ok(())
 }
 
 /// `gmcli status` — registration state plus the per-product offer table.
@@ -1016,15 +973,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mainnet_refuses_a_gemini_image_declaration_before_catalog_fetch() {
-        // Image products stay in the universal catalog vocabulary, but a
-        // single declaration on the default/mainnet profile must fail before
-        // even reading that catalog. This makes an accidental paid/mainnet
-        // enablement impossible through the operator CLI.
+    async fn mainnet_permits_a_gemini_image_declaration() {
         let server = MockServer::start().await;
+        mount_catalog(
+            &server,
+            serde_json::json!([{
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "status": "active",
+                "retail_price": retail(500_000_000, 3_000_000_000),
+            }]),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
         let mut client = RegistryClient::new(config_for_network(&server, Network::Mainnet));
 
-        let err = cmd_declare_product(
+        cmd_declare_product(
             &mut client,
             &Provider::Gemini,
             "gemini-3.1-flash-image",
@@ -1032,24 +1004,9 @@ mod tests {
             DeclareArgs::default(),
         )
         .await
-        .expect_err("Gemini image offers are testnet-only");
+        .expect("mainnet permits the image offer");
 
-        let message = err.to_string();
-        assert!(message.contains("testnet-only"), "got: {message}");
-        assert!(message.contains("--network testnet"), "got: {message}");
-        assert_eq!(hits(&server, "GET", "/products").await, 0);
-        assert_eq!(hits(&server, "POST", "/miners/products").await, 0);
-    }
-
-    #[test]
-    fn bare_default_network_refuses_gemini_image_declarations() {
-        let error = ensure_declaration_network(
-            Network::default(),
-            &Provider::Gemini,
-            "gemini-3.1-flash-lite-image",
-        )
-        .expect_err("the default network is mainnet");
-        assert!(error.to_string().contains("testnet-only"));
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
     }
 
     #[tokio::test]
@@ -1090,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn image_products_are_not_removed_from_universal_catalog_filter() {
+    fn image_products_remain_in_the_declaration_filter() {
         let image = Product {
             provider: "gemini".to_owned(),
             model: "gemini-3.1-flash-lite-image".to_owned(),
@@ -1101,7 +1058,6 @@ mod tests {
         let products = [image];
         let targets = filter_catalog(&products, Some(&Provider::Gemini));
         assert_eq!(targets.len(), 1);
-        assert!(is_testnet_only_image_product(targets[0]));
     }
 
     #[tokio::test]
@@ -1276,7 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mainnet_fan_out_omits_both_gemini_image_products() {
+    async fn mainnet_fan_out_declares_gemini_image_products() {
         let server = MockServer::start().await;
         mount_catalog(
             &server,
@@ -1341,6 +1297,24 @@ mod tests {
         mount_declare(
             &server,
             serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-lite-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
+                "provider": "gemini",
+                "model": "gemini-3.1-flash-image",
+                "discount_bp": 500,
+            }),
+        )
+        .await;
+        mount_declare(
+            &server,
+            serde_json::json!({
                 "provider": "anthropic",
                 "model": "claude-sonnet-4-6",
                 "discount_bp": 500,
@@ -1351,10 +1325,10 @@ mod tests {
         let mut client = RegistryClient::new(config_for_network(&server, Network::Mainnet));
         let outcome = cmd_declare_products(&mut client, None, 500, true)
             .await
-            .expect("mainnet fan-out keeps safe non-image products");
+            .expect("mainnet fan-out includes image products");
 
         assert_eq!(outcome, DeclareOutcome::Declared);
-        assert_eq!(hits(&server, "POST", "/miners/products").await, 1);
+        assert_eq!(hits(&server, "POST", "/miners/products").await, 3);
     }
 
     #[test]

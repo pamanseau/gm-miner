@@ -151,16 +151,15 @@ publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement
 The Gemini image-generation products `gemini-3.1-flash-lite-image` and
 `gemini-3.1-flash-image` use Google's native
 `POST /v1beta/models/{model}:generateContent` API. They are not OpenAI-compatible
-chat routes. Their universal definitions remain in CLI code and the product
-vocabulary,
-so pricing, status, and older catalog payloads can decode every image
-dimension. Mainnet publication, discovery, and declaration are excluded for
-this rollout: the default/mainnet `declare-product` refuses them and
-`declare-products` omits them. Select the network explicitly to declare them
-on testnet:
+chat routes. Their definitions are available on both networks, so pricing,
+status, and catalog payloads can decode every image dimension. Select the
+network whose offer you intend to change:
 
 ```sh
 gmcli --network testnet declare-product \
+  --provider gemini --model gemini-3.1-flash-image --discount-pct 5
+
+gmcli --network mainnet declare-product \
   --provider gemini --model gemini-3.1-flash-image --discount-pct 5
 ```
 
