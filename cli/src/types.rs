@@ -13,6 +13,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
+/// The two Gemini image-generation buyer products in the testnet-first MVP.
+///
+/// These identifiers are part of the universal product/catalog vocabulary:
+/// they remain deserialisable and renderable on every network. Network policy
+/// belongs to declaration and canary commands, not to the product type, so a
+/// mainnet catalog can still explain an image product that must not be
+/// offered there.
+pub const GEMINI_IMAGE_MODELS: [&str; 2] =
+    ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"];
+
+/// Whether a provider/model pair is one of the Gemini image products.
+#[must_use]
+pub fn is_gemini_image_model(provider: &str, model: &str) -> bool {
+    provider == "gemini" && GEMINI_IMAGE_MODELS.contains(&model)
+}
+
 /// Provider identifier — must match the canonical enum in product.json.
 ///
 /// `Benchmark` exists so a serde decode of any payload that mentions the
@@ -165,6 +181,13 @@ pub struct RetailDimensions {
     pub audio_input_per_mtok_ndollars: Option<u64>,
     #[serde(default)]
     pub audio_output_per_mtok_ndollars: Option<u64>,
+    /// Native image-generation token prices. Image-capable Gemini products
+    /// price these independently from text/audio tokens; ordinary text
+    /// products leave both dimensions null.
+    #[serde(default)]
+    pub image_input_per_mtok_ndollars: Option<u64>,
+    #[serde(default)]
+    pub image_output_per_mtok_ndollars: Option<u64>,
     #[serde(default)]
     pub cache_storage_per_mtok_hour_ndollars: Option<u64>,
     /// Input-token count above which the long-context tier applies. Not a

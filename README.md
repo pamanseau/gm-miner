@@ -148,6 +148,30 @@ available to you. A single worker can serve only one route per model, so run two
 two upstreams for the same model. Run `gmcli sources` to see the routes your registry currently
 publishes, and read [sourcing routes](docs/sourcing.md) for setup and settlement details.
 
+The Gemini image-generation products `gemini-3.1-flash-lite-image` and
+`gemini-3.1-flash-image` use Google's native
+`POST /v1beta/models/{model}:generateContent` API. They are not OpenAI-compatible
+chat routes. Their universal definitions remain in CLI code and the product
+vocabulary,
+so pricing, status, and older catalog payloads can decode every image
+dimension. Mainnet publication, discovery, and declaration are excluded for
+this rollout: the default/mainnet `declare-product` refuses them and
+`declare-products` omits them. Select the network explicitly to declare them
+on testnet:
+
+```sh
+gmcli --network testnet declare-product \
+  --provider gemini --model gemini-3.1-flash-image --discount-pct 5
+```
+
+Capability and health checks use a text-only Gemini request and do not generate
+a paid image. When you intentionally want to spend one small native image
+request per SKU on testnet, use the [Gemini image canary](docs/image-canary.md);
+it preflights both live eligible offers and prints only safe response/balance
+reconciliation evidence. Downstream validator, finalizer, and dashboard
+evidence is a separate GM runbook check. See the [provider support
+matrix](docs/provider-model-support.md) for the provider-side setup.
+
 To serve the existing `anthropic` route through AWS Bedrock Claude instead of the direct Anthropic
 API, select Bedrock and provide the Bedrock region and API key:
 
@@ -262,7 +286,7 @@ deployments named exactly like the gm model id do not need it.
 
 Before anything is sent, both commands resolve the percentage into the absolute per-Mtok price
 you would receive on **every dimension the product prices** — input and output, plus prompt
-cache, audio and long-context rates where the model has them — print those figures, and ask you
+cache, audio, image and long-context rates where the model has them — print those figures, and ask you
 to confirm. Dimensions a model does not price are not listed. Pass `--yes` to skip the prompt;
 a non-interactive stdin skips it too, so scripted declarations keep working unchanged.
 
@@ -341,6 +365,7 @@ gmcli worker remove <worker_id>
 | `gmcli earnings` | On-chain hotkey emission from the subnet metagraph (requires btcli) |
 | `gmcli doctor` | Preflight checklist (network, login, keys, Phala CLI + key, hotkey) |
 | `gmcli check-streaming` | Probe streaming through one selected worker: its verified provider/model coverage, including each offered sourcing route and upstream key slot |
+| `gmcli image-canary` | Testnet-only, funded native Gemini image preflight and two-SKU settlement reconciliation (paid; never part of health checks) |
 | `gmcli update` | Upgrade gmcli in place to the latest release (no login required) |
 | `gmcli worker add` | Attach a new Phala CVM as an additional worker |
 | `gmcli worker list` | List workers with per-worker status and last attestation |
@@ -360,6 +385,11 @@ GMCLI_CONFIG_DIR=/path/to/dir gmcli login
 
 The `GM_REGISTRY_URL` env var overrides the registry API URL for a single run without
 persisting it.
+
+The paid image canary uses a buyer key, not a provider key. Set `GM_API_KEY` (or
+pass `--buyer-api-key`) and run it with `--network testnet`. It defaults to the
+testnet gateway; `GM_GATEWAY_URL` is available only as a per-run override for
+local/mock verification. See [docs/image-canary.md](docs/image-canary.md).
 
 ## Troubleshooting
 

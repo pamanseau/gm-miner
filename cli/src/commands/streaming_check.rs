@@ -9,7 +9,10 @@ use anyhow::{bail, Context as _, Result};
 use gm_miner_cli::{
     client::{build_data_plane_probe_client, build_http_client, RegistryClient, ME_PATH},
     config::{Config, ProviderKeys, WorkerRecord},
-    types::{MinerStatus, ProductCatalogResponse, Provider, WorkerEntry, WorkerListResponse},
+    types::{
+        is_gemini_image_model, MinerStatus, ProductCatalogResponse, Provider, WorkerEntry,
+        WorkerListResponse,
+    },
     workers::first_live_worker_id,
 };
 use reqwest::Url;
@@ -232,6 +235,17 @@ async fn run_streaming_checks(cfg: &Config, target: &StreamingTarget) {
             continue;
         }
         for selected in models {
+            if is_gemini_image_model(provider.as_str(), &selected.model.canonical) {
+                // The image SKUs are native generateContent products, not
+                // OpenAI-compatible SSE models. Do not send a streaming
+                // probe to them: even a text-looking prompt could select
+                // image output and charge the miner's Google account.
+                println!(
+                    "  [--] {provider}/{}: native generateContent image SKU skipped by streaming self-test (no image request sent)",
+                    selected.model.canonical
+                );
+                continue;
+            }
             let probe = build_probe(provider.clone(), &selected.model, selected.slot);
             let result = run_provider_probe(target, &probe).await;
             print_probe_result(&probe, result);
@@ -1123,6 +1137,26 @@ mod tests {
             Value::String("z-ai/glm-5.2".to_owned())
         );
         assert_eq!(probe.model, "z-ai/glm-5.2");
+    }
+
+    #[test]
+    fn gemini_image_skus_are_excluded_from_paid_streaming_probes() {
+        assert!(is_gemini_image_model(
+            Provider::Gemini.as_str(),
+            "gemini-3.1-flash-lite-image"
+        ));
+        assert!(is_gemini_image_model(
+            Provider::Gemini.as_str(),
+            "gemini-3.1-flash-image"
+        ));
+        assert!(!is_gemini_image_model(
+            Provider::Gemini.as_str(),
+            "gemini-3.1-flash"
+        ));
+        assert!(!is_gemini_image_model(
+            Provider::OpenAI.as_str(),
+            "gemini-3.1-flash-image"
+        ));
     }
 
     #[test]
