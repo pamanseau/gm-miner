@@ -16,10 +16,9 @@ use strum::EnumIter;
 /// The two Gemini image-generation buyer products.
 ///
 /// These identifiers are part of the universal product/catalog vocabulary:
-/// they remain deserialisable and renderable on every network. Network policy
-/// belongs to declaration and canary commands, not to the product type, so a
-/// mainnet catalog can still explain an image product that must not be
-/// offered there.
+/// they remain deserialisable, renderable, and offerable on every network.
+/// The paid canary's testnet-only safety policy belongs to that command, not
+/// to the product type.
 pub const GEMINI_IMAGE_MODELS: [&str; 2] =
     ["gemini-3.1-flash-lite-image", "gemini-3.1-flash-image"];
 
