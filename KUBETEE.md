@@ -3,53 +3,65 @@
 `CLAUDE.md` is upstream (`taostat/gm-miner`). Keep KubeTEE-only
 guidance here so a submodule update does not clobber it.
 
-## Phala rollout (replace a live CVM)
+## Phala rollout (serial — one CVM at a time)
 
-**Start the new instance first. Delete the old one only after the new worker is up.**
+Roll the fleet **one CVM at a time**: delete one, start its replacement,
+verify it, and only then move to the next. With every other worker still
+active and serving, each step is outage-free — deleting more than one CVM
+before its replacement is verified is not.
 
-`deploy` against the live `--app-name` will refuse (name collision) and print
-`phala cvms delete`. Do **not** follow that hint while the old CVM is still the
-serving worker: tearing it down first leaves the hotkey with `failed_attestation`
-and no eligible offers until the replacement boots. `gmcli deploy` is only for
-worker #1 on a fresh hotkey; a second (or replacement) instance is always
-`worker add` with a **new** `--app-name`.
+Per CVM, in order:
 
 ```bash
-# 1. Record the live worker (old worker_id + Phala app_id / app-name).
-gmcli worker list
-phala cvms ls
+# 1. Delete the OLD instance. CVM first (stops billing / the TEE),
+#    then the registry row.
+phala cvms delete <old_app_id> --yes
+gmcli worker remove <old_worker_id>
+# `worker remove` deregisters the registry row AND drops the local record —
+# that is what frees the --app-name and lets the re-add mint a fresh node
+# secret (envoy, registry, and gateway all start from the same new value).
 
-# 2. Boot a new CVM under an unused name. Same flags as the live worker
-#    (instance type, digest-pinned image, boot timeout, network).
-gmcli worker add --app-name gm-miner-2 --yes --accept-terms \
+# 2. Start the replacement under the SAME app-name, same flags as the fleet.
+gmcli worker add --app-name gm-miner-0 --yes --accept-terms \
   --network mainnet \
-  --instance-type tdx.large \
-  --image-ref ghcr.io/taostat/gm-miner@sha256:<approved> \
+  --instance-type tdx.medium \
+  --disk-size 40G \
+  --os-image dstack-0.5.9 \
   --boot-timeout-secs 600
+# Name reuse is safe because step 1 already removed the old CVM and its
+# worker record, so gmcli's name-collision preflight passes. (gmcli deploy /
+# worker add stopping with "phala cvms delete <app_id>" means step 1 was
+# missed for that name — it is a preflight, not an upgrade procedure; gmcli
+# never deletes a CVM itself.)
 
-# 3. Wait until ALL are true — not merely "CVM created":
-#    - phala cvms get <new_app_id> is running
-#    - gmcli worker list shows the new worker active (attestation passed)
-#    - gmcli status shows the hotkey's offers eligible
+# 3. Verify ALL before touching the next CVM:
+#    a. phala cvms get <new_app_id> → running
+#    b. gmcli worker list → the new worker active (attestation passed).
+#       A first failed_attestation cycle is a boot race — wait one cycle.
+#    c. gm-miner is actually serving — smoke the data plane (curl below).
+#    d. gmcli status → the hotkey's offers eligible.
+phala cvms get <new_app_id>
 gmcli worker list
 gmcli status
 
-# 4. Only then tear down the old instance. Order matters:
-#    CVM first (stops billing / the TEE), then registry.
-phala cvms delete <old_app_id> --yes
-gmcli worker remove <old_worker_id>
+# 4. Repeat 1–3 for the next CVM until the whole fleet is rolled.
 ```
 
-`worker remove` deregisters the registry row only — it does **not** delete the
-Phala CVM. Do not `worker remove` the old worker before the new one is `active`.
-Do not reuse the live `--app-name` to "upgrade in place."
+Data-plane smoke test for (c) — needs the fresh node secret from the
+re-rendered `dist/<app>/.env` and the `x-gm-provider` routing header:
 
-`phala deploy` cannot reuse a CVM name, so `deploy` / `worker add` probe for an
-existing CVM under `--app-name` and stop with the `phala cvms delete <app_id>`
-to run. That message is a **name collision**, not an upgrade procedure. gmcli
-never deletes a CVM: that destroys a running worker and stays the operator's
-explicit act. To replace a live instance, start a **new** CVM first — never
-delete the old one to free the name.
+```bash
+curl -sk -m 60 <endpoint>-8080s.dstack-pha-prodX.phala.network/v1/chat/completions \
+  -H "x-gm-node-key: <GM_NODE_SECRET from dist/<app>/.env>" \
+  -H "Authorization: Bearer <KUBETEE_API_KEY from dist/<app>/.env>" \
+  -H "content-type: application/json" \
+  -H "x-gm-provider: kubetee" \
+  -d '{"model":"z-ai/glm-5.3","messages":[{"role":"user","content":"say ok"}],"max_tokens":5}'
+```
+
+`gmcli deploy` is only for worker #1 on a fresh hotkey; every later (or
+replacement) instance is `worker add`. Do not attempt to "upgrade in
+place" against a running CVM.
 
 ## KubeTEE upstream: HTTP/2 (stock envoy config is correct)
 
@@ -70,16 +82,7 @@ the stock config also stays.)
 `gmcli worker add`'s advisory streaming self-test probes the new CVM seconds
 after creation, before envoy has settled on a fresh boot. `[!!] kubetee/...:
 check failed` on every route at deploy time is expected; re-probe manually
-after ~60s before suspecting a real problem:
-
-```bash
-curl -sk -m 60 <endpoint>-8080s.dstack-pha-prodX.phala.network/v1/chat/completions \
-  -H "x-gm-node-key: <GM_NODE_SECRET from dist/<app>/.env>" \
-  -H "Authorization: Bearer <KUBETEE_API_KEY from dist/<app>/.env>" \
-  -H "content-type: application/json" \
-  -H "x-gm-provider: kubetee" \
-  -d '{"model":"z-ai/glm-5.3","messages":[{"role":"user","content":"say ok"}],"max_tokens":5}'
-```
+with the smoke test above after ~60s before suspecting a real problem.
 
 A new worker may also show `failed_attestation` on its first registry cycle
 (boot race) — the next cycle flips it to `active`.
